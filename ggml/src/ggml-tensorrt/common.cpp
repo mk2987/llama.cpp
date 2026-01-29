@@ -1,0 +1,75 @@
+#include "common.hpp"
+#include "ggml-impl.h"
+
+#include <cstdio>
+#include <cstring>
+
+namespace ggml_tensorrt {
+
+// Logger implementation
+Logger::Logger(Severity min_severity)
+    : min_severity_(min_severity) {
+}
+
+void Logger::log(Severity severity, const char* msg) noexcept {
+    if (severity > min_severity_) {
+        return;
+    }
+
+    const char* level = "";
+    switch (severity) {
+        case Severity::kINTERNAL_ERROR: level = "INTERNAL_ERROR"; break;
+        case Severity::kERROR:          level = "ERROR"; break;
+        case Severity::kWARNING:        level = "WARN"; break;
+        case Severity::kINFO:           level = "INFO"; break;
+        case Severity::kVERBOSE:        level = "DEBUG"; break;
+    }
+
+    fprintf(stderr, "[TensorRT-RTX] [%s] %s\n", level, msg);
+}
+
+void Logger::set_min_severity(Severity severity) {
+    min_severity_ = severity;
+}
+
+// Backend context implementation
+ggml_backend_tensorrt_context::ggml_backend_tensorrt_context(int device_id)
+    : device(device_id), stream(nullptr) {
+
+    // Set CUDA device
+    CUDA_CHECK(cudaSetDevice(device));
+
+    // Create CUDA stream
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    // Create logger
+    logger = std::make_unique<Logger>(nvinfer1::ILogger::Severity::kWARNING);
+
+    // Create TensorRT runtime (will be implemented in later milestones)
+    // runtime = std::unique_ptr<nvinfer1::IRuntime>(
+    //     nvinfer1::createInferRuntime(*logger));
+
+    GGML_LOG_INFO("%s: initialized TensorRT-RTX backend on device %d\n", __func__, device);
+}
+
+ggml_backend_tensorrt_context::~ggml_backend_tensorrt_context() {
+    if (stream) {
+        cudaStreamDestroy(stream);
+        stream = nullptr;
+    }
+}
+
+// Helper functions
+const char* cuda_error_to_str(cudaError_t err) {
+    return cudaGetErrorString(err);
+}
+
+void check_cuda(cudaError_t err, const char* file, int line) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[TensorRT-RTX] CUDA error at %s:%d: %s\n",
+                file, line, cuda_error_to_str(err));
+        GGML_ABORT("CUDA error");
+    }
+}
+
+} // namespace ggml_tensorrt
