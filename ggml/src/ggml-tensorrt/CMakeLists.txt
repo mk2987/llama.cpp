@@ -57,8 +57,11 @@ set_target_properties(ggml-tensorrt PROPERTIES
 )
 
 # Include directories
-target_include_directories(ggml-tensorrt PRIVATE
+# Mark TensorRT headers as SYSTEM to suppress their warnings
+target_include_directories(ggml-tensorrt SYSTEM PRIVATE
     ${TENSORRT_INCLUDE_DIRS}
+)
+target_include_directories(ggml-tensorrt PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
@@ -82,5 +85,6 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -Wextra
         -Wno-unused-parameter
         -Wno-unused-function
+        -Wno-deprecated-declarations  # Suppress TensorRT-RTX header deprecation warnings
     )
 endif()

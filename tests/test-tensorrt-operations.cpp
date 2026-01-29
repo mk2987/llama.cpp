@@ -46,11 +46,10 @@ static bool test_mul_mat() {
     printf("Testing MUL_MAT operation...\n");
 
     // Create context
-    struct ggml_init_params params = {
-        .mem_size   = 128 * 1024 * 1024,
-        .mem_buffer = NULL,
-        .no_alloc   = false,
-    };
+    struct ggml_init_params params;
+    params.mem_size   = 128 * 1024 * 1024;
+    params.mem_buffer = NULL;
+    params.no_alloc   = true;  // Required for backend allocation
     struct ggml_context* ctx = ggml_init(params);
     ASSERT_TRUE(ctx != NULL);
 
@@ -67,9 +66,9 @@ static bool test_mul_mat() {
     struct ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
     struct ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
 
-    // Fill with test data
-    float* a_data = (float*)a->data;
-    float* b_data = (float*)b->data;
+    // Prepare test data in temporary arrays
+    std::vector<float> a_data(K * M);
+    std::vector<float> b_data(K * N);
 
     for (int64_t i = 0; i < K * M; ++i) {
         a_data[i] = (float)(i % 10);
@@ -89,8 +88,8 @@ static bool test_mul_mat() {
     ASSERT_TRUE(buffer_trt != NULL);
 
     // Copy input data to backend
-    ggml_backend_tensor_set(a, a_data, 0, ggml_nbytes(a));
-    ggml_backend_tensor_set(b, b_data, 0, ggml_nbytes(b));
+    ggml_backend_tensor_set(a, a_data.data(), 0, ggml_nbytes(a));
+    ggml_backend_tensor_set(b, b_data.data(), 0, ggml_nbytes(b));
 
     // Execute
     ggml_backend_graph_compute(backend_trt, gf);
@@ -117,11 +116,10 @@ static bool test_mul_mat() {
 static bool test_add() {
     printf("Testing ADD operation...\n");
 
-    struct ggml_init_params params = {
-        .mem_size   = 128 * 1024 * 1024,
-        .mem_buffer = NULL,
-        .no_alloc   = false,
-    };
+    struct ggml_init_params params;
+    params.mem_size   = 128 * 1024 * 1024;
+    params.mem_buffer = NULL;
+    params.no_alloc   = true;  // Required for backend allocation
     struct ggml_context* ctx = ggml_init(params);
     ASSERT_TRUE(ctx != NULL);
 
@@ -133,9 +131,9 @@ static bool test_add() {
     struct ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
     struct ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
 
-    // Fill with test data
-    float* a_data = (float*)a->data;
-    float* b_data = (float*)b->data;
+    // Prepare test data in temporary arrays
+    std::vector<float> a_data(n);
+    std::vector<float> b_data(n);
 
     for (int64_t i = 0; i < n; ++i) {
         a_data[i] = (float)i;
@@ -151,8 +149,8 @@ static bool test_add() {
     ggml_backend_buffer_t buffer_trt = ggml_backend_alloc_ctx_tensors(ctx, backend_trt);
     ASSERT_TRUE(buffer_trt != NULL);
 
-    ggml_backend_tensor_set(a, a_data, 0, ggml_nbytes(a));
-    ggml_backend_tensor_set(b, b_data, 0, ggml_nbytes(b));
+    ggml_backend_tensor_set(a, a_data.data(), 0, ggml_nbytes(a));
+    ggml_backend_tensor_set(b, b_data.data(), 0, ggml_nbytes(b));
 
     ggml_backend_graph_compute(backend_trt, gf);
 
@@ -179,11 +177,10 @@ static bool test_add() {
 static bool test_rms_norm() {
     printf("Testing RMS_NORM operation...\n");
 
-    struct ggml_init_params params = {
-        .mem_size   = 128 * 1024 * 1024,
-        .mem_buffer = NULL,
-        .no_alloc   = false,
-    };
+    struct ggml_init_params params;
+    params.mem_size   = 128 * 1024 * 1024;
+    params.mem_buffer = NULL;
+    params.no_alloc   = true;  // Required for backend allocation
     struct ggml_context* ctx = ggml_init(params);
     ASSERT_TRUE(ctx != NULL);
 
@@ -194,8 +191,8 @@ static bool test_rms_norm() {
     const int64_t n = 64;
     struct ggml_tensor* x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
 
-    // Fill with test data
-    float* x_data = (float*)x->data;
+    // Prepare test data in temporary array
+    std::vector<float> x_data(n);
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
 
@@ -212,7 +209,7 @@ static bool test_rms_norm() {
     ggml_backend_buffer_t buffer_trt = ggml_backend_alloc_ctx_tensors(ctx, backend_trt);
     ASSERT_TRUE(buffer_trt != NULL);
 
-    ggml_backend_tensor_set(x, x_data, 0, ggml_nbytes(x));
+    ggml_backend_tensor_set(x, x_data.data(), 0, ggml_nbytes(x));
 
     ggml_backend_graph_compute(backend_trt, gf);
 
@@ -240,6 +237,8 @@ static bool test_rms_norm() {
 }
 
 int main(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
     printf("=== TensorRT-RTX Backend Operations Test (Milestone 2) ===\n\n");
 
     bool all_passed = true;
