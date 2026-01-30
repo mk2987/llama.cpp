@@ -236,6 +236,121 @@ static bool test_rms_norm() {
     return true;
 }
 
+// Integration test: Multi-layer network (matmul → add → matmul)
+static bool test_multi_layer() {
+    printf("Testing multi-layer integration (MUL_MAT → ADD → MUL_MAT)...\n");
+
+    struct ggml_init_params params;
+    params.mem_size   = 128 * 1024 * 1024;
+    params.mem_buffer = NULL;
+    params.no_alloc   = true;  // Required for backend allocation
+    struct ggml_context* ctx = ggml_init(params);
+    ASSERT_TRUE(ctx != NULL);
+
+    ggml_backend_t backend_trt = ggml_backend_tensorrt_init(0);
+    ASSERT_TRUE(backend_trt != NULL);
+
+    // Create a 2-layer network:
+    // Layer 1: x @ W1 + b1 → h
+    // Layer 2: h @ W2 → y
+
+    // Dimensions:
+    // x:  [4, 3]   (3 samples, 4 features)
+    // W1: [4, 5]   (4 input features, 5 hidden units)
+    // b1: [5, 3]   (bias, broadcasted)
+    // h:  [5, 3]   (hidden layer)
+    // W2: [5, 2]   (5 hidden units, 2 output units)
+    // y:  [2, 3]   (final output)
+
+    const int64_t n_samples = 3;
+    const int64_t n_input = 4;
+    const int64_t n_hidden = 5;
+    const int64_t n_output = 2;
+
+    // Input and weights
+    struct ggml_tensor* x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_input, n_samples);
+    struct ggml_tensor* W1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_input, n_hidden);
+    struct ggml_tensor* b1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hidden, n_samples);
+    struct ggml_tensor* W2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hidden, n_output);
+
+    // Prepare test data
+    std::vector<float> x_data(n_input * n_samples);
+    std::vector<float> W1_data(n_input * n_hidden);
+    std::vector<float> b1_data(n_hidden * n_samples);
+    std::vector<float> W2_data(n_hidden * n_output);
+
+    // Initialize with simple values
+    for (int64_t i = 0; i < n_input * n_samples; ++i) {
+        x_data[i] = (float)(i % 10) * 0.1f;
+    }
+    for (int64_t i = 0; i < n_input * n_hidden; ++i) {
+        W1_data[i] = (float)(i % 7) * 0.1f;
+    }
+    for (int64_t i = 0; i < n_hidden * n_samples; ++i) {
+        b1_data[i] = 0.5f;  // Constant bias
+    }
+    for (int64_t i = 0; i < n_hidden * n_output; ++i) {
+        W2_data[i] = (float)(i % 5) * 0.1f;
+    }
+
+    // Build computation graph
+    struct ggml_cgraph* gf = ggml_new_graph(ctx);
+
+    // Layer 1: h = x @ W1 + b1
+    struct ggml_tensor* h_matmul = ggml_mul_mat(ctx, W1, x);
+    struct ggml_tensor* h = ggml_add(ctx, h_matmul, b1);
+
+    // Layer 2: y = h @ W2
+    struct ggml_tensor* y = ggml_mul_mat(ctx, W2, h);
+
+    ggml_build_forward_expand(gf, y);
+
+    // Allocate buffers
+    ggml_backend_buffer_t buffer_trt = ggml_backend_alloc_ctx_tensors(ctx, backend_trt);
+    ASSERT_TRUE(buffer_trt != NULL);
+
+    // Copy input data to backend
+    ggml_backend_tensor_set(x,  x_data.data(),  0, ggml_nbytes(x));
+    ggml_backend_tensor_set(W1, W1_data.data(), 0, ggml_nbytes(W1));
+    ggml_backend_tensor_set(b1, b1_data.data(), 0, ggml_nbytes(b1));
+    ggml_backend_tensor_set(W2, W2_data.data(), 0, ggml_nbytes(W2));
+
+    // Execute graph
+    ggml_backend_graph_compute(backend_trt, gf);
+
+    // Get result
+    std::vector<float> y_result(n_output * n_samples);
+    ggml_backend_tensor_get(y, y_result.data(), 0, ggml_nbytes(y));
+
+    // Verify dimensions
+    ASSERT_TRUE(y->ne[0] == n_output);
+    ASSERT_TRUE(y->ne[1] == n_samples);
+
+    // Compute expected result manually for first element as a sanity check
+    // y[0] = sum over hidden dimension of (h[i] * W2[i,0])
+    // h[i] = sum over input dimension of (x[j] * W1[j,i]) + b1[i]
+
+    // For now, just check that we got numerical results (not NaN/inf)
+    for (int64_t i = 0; i < n_output * n_samples; ++i) {
+        ASSERT_TRUE(!std::isnan(y_result[i]));
+        ASSERT_TRUE(!std::isinf(y_result[i]));
+    }
+
+    printf("Multi-layer integration test PASSED!\n");
+    printf("  Input shape: [%lld, %lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
+    printf("  Hidden shape: [%lld, %lld]\n", (long long)h->ne[0], (long long)h->ne[1]);
+    printf("  Output shape: [%lld, %lld]\n", (long long)y->ne[0], (long long)y->ne[1]);
+    printf("  Sample output values: %.4f, %.4f, %.4f\n",
+           y_result[0], y_result[1], y_result[2]);
+
+    // Cleanup
+    ggml_backend_buffer_free(buffer_trt);
+    ggml_backend_free(backend_trt);
+    ggml_free(ctx);
+
+    return true;
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -243,10 +358,13 @@ int main(int argc, char** argv) {
 
     bool all_passed = true;
 
-    // Run tests
+    // Run unit tests
     all_passed &= test_mul_mat();
     all_passed &= test_add();
     all_passed &= test_rms_norm();
+
+    // Run integration test
+    all_passed &= test_multi_layer();
 
     printf("\n=== Test Summary ===\n");
     if (all_passed) {
