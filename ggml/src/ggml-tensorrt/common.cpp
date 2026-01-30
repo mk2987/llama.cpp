@@ -45,9 +45,14 @@ ggml_backend_tensorrt_context::ggml_backend_tensorrt_context(int device_id)
     // Create logger
     logger = std::make_unique<Logger>(nvinfer1::ILogger::Severity::kWARNING);
 
-    // Create TensorRT runtime (will be implemented in later milestones)
-    // runtime = std::unique_ptr<nvinfer1::IRuntime>(
-    //     nvinfer1::createInferRuntime(*logger));
+    // Create TensorRT runtime
+    runtime = std::unique_ptr<nvinfer1::IRuntime>(
+        nvinfer1::createInferRuntime(*logger));
+
+    if (!runtime) {
+        GGML_LOG_ERROR("%s: failed to create TensorRT runtime\n", __func__);
+        GGML_ABORT("Failed to create TensorRT runtime");
+    }
 
     GGML_LOG_INFO("%s: initialized TensorRT-RTX backend on device %d\n", __func__, device);
 }
