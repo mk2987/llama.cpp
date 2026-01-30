@@ -309,13 +309,48 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
     CUDA_CHECK(cudaSetDevice(ctx->device));
 
-    // For now, we don't support any operations - they will all fall back to CUDA
-    // This will be implemented in Milestone 4
-    (void) cgraph;
+    // Process each node in the graph
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
 
-    GGML_LOG_DEBUG("%s: graph computation not yet implemented, falling back to CUDA\n", __func__);
+        switch (node->op) {
+            // Storage and view operations (no-ops, handled by metadata)
+            case GGML_OP_NONE:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                // These are metadata-only operations, no GPU work needed
+                break;
 
-    return GGML_STATUS_FAILED;
+            // Copy operations - use CUDA memcpy
+            case GGML_OP_CPY:
+            case GGML_OP_DUP:
+            case GGML_OP_CONT:
+                {
+                    const size_t nb = ggml_nbytes(node);
+                    if (node->src[0] && node->src[0]->data && node->data) {
+                        CUDA_CHECK(cudaMemcpyAsync(node->data, node->src[0]->data, nb,
+                                                   cudaMemcpyDeviceToDevice, ctx->stream));
+                    }
+                }
+                break;
+
+            case GGML_OP_SET_ROWS:
+                // SET_ROWS is used for KV cache updates
+                // For now, fall back to CUDA for actual implementation
+                GGML_LOG_DEBUG("%s: SET_ROWS operation not yet implemented, falling back\n", __func__);
+                return GGML_STATUS_FAILED;
+
+            default:
+                // All other compute operations fall back to CUDA
+                GGML_LOG_DEBUG("%s: unsupported operation %s, falling back to CUDA\n",
+                               __func__, ggml_op_name(node->op));
+                return GGML_STATUS_FAILED;
+        }
+    }
+
+    return GGML_STATUS_SUCCESS;
 }
 
 static const ggml_backend_i ggml_backend_tensorrt_interface = {
