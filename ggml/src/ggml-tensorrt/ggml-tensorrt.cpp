@@ -1,14 +1,18 @@
 #include "common.hpp"
+#include "network-builder.hpp"
+#include "engine-manager.hpp"
 #include "ggml-tensorrt.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 
 #include <cuda_runtime.h>
+#include <NvInfer.h>
 #include <cassert>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <set>
 
 using namespace ggml_tensorrt;
 
@@ -309,45 +313,148 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
     CUDA_CHECK(cudaSetDevice(ctx->device));
 
-    // Process each node in the graph
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_tensor * node = cgraph->nodes[i];
-
-        switch (node->op) {
-            // Storage and view operations (no-ops, handled by metadata)
-            case GGML_OP_NONE:
-            case GGML_OP_VIEW:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                // These are metadata-only operations, no GPU work needed
-                break;
-
-            // Copy operations - use CUDA memcpy
-            case GGML_OP_CPY:
-            case GGML_OP_DUP:
-            case GGML_OP_CONT:
-                {
-                    const size_t nb = ggml_nbytes(node);
-                    if (node->src[0] && node->src[0]->data && node->data) {
-                        CUDA_CHECK(cudaMemcpyAsync(node->data, node->src[0]->data, nb,
-                                                   cudaMemcpyDeviceToDevice, ctx->stream));
-                    }
-                }
-                break;
-
-            case GGML_OP_SET_ROWS:
-                // SET_ROWS is used for KV cache updates
-                // For now, fall back to CUDA for actual implementation
-                GGML_LOG_DEBUG("%s: SET_ROWS operation not yet implemented, falling back\n", __func__);
-                return GGML_STATUS_FAILED;
-
-            default:
-                // All other compute operations fall back to CUDA
-                GGML_LOG_DEBUG("%s: unsupported operation %s, falling back to CUDA\n",
-                               __func__, ggml_op_name(node->op));
-                return GGML_STATUS_FAILED;
+    try {
+        // Step 1: Create TensorRT builder and network
+        std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(*ctx->logger));
+        if (!builder) {
+            GGML_LOG_ERROR("%s: failed to create TensorRT builder\n", __func__);
+            return GGML_STATUS_FAILED;
         }
+
+        const uint32_t explicit_batch = 1U << static_cast<uint32_t>(
+            nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+        std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(explicit_batch));
+        if (!network) {
+            GGML_LOG_ERROR("%s: failed to create TensorRT network\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+
+        // Step 2: Create network builder wrapper
+        NetworkBuilder net_builder(network.get(), ctx->logger.get());
+
+        // Step 3: Identify and add leaf tensors (inputs) to the network
+        std::set<const ggml_tensor*> leaf_tensors;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (node->src[j] && node->src[j]->op == GGML_OP_NONE) {
+                    leaf_tensors.insert(node->src[j]);
+                }
+            }
+        }
+
+        // Add leaf tensors as network inputs
+        for (const ggml_tensor* leaf : leaf_tensors) {
+            char name[64];
+            snprintf(name, sizeof(name), "input_%p", (void*)leaf);
+            if (!net_builder.add_input(leaf, name)) {
+                GGML_LOG_ERROR("%s: failed to add input tensor\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
+        }
+
+        // Step 4: Process graph nodes and build TensorRT network
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+
+            switch (node->op) {
+                // Storage and view operations (no-ops)
+                case GGML_OP_NONE:
+                case GGML_OP_VIEW:
+                case GGML_OP_RESHAPE:
+                case GGML_OP_PERMUTE:
+                case GGML_OP_TRANSPOSE:
+                    continue;
+
+                // Copy operations - use CUDA memcpy directly
+                case GGML_OP_CPY:
+                case GGML_OP_DUP:
+                case GGML_OP_CONT:
+                    {
+                        const size_t nb = ggml_nbytes(node);
+                        if (node->src[0] && node->src[0]->data && node->data) {
+                            CUDA_CHECK(cudaMemcpyAsync(node->data, node->src[0]->data, nb,
+                                                       cudaMemcpyDeviceToDevice, ctx->stream));
+                        }
+                    }
+                    continue;
+
+                case GGML_OP_SET_ROWS:
+                    GGML_LOG_DEBUG("%s: SET_ROWS not implemented, falling back\n", __func__);
+                    return GGML_STATUS_FAILED;
+
+                default:
+                    // Add operation to TensorRT network
+                    nvinfer1::ITensor* output = net_builder.add_operation(node);
+                    if (!output) {
+                        GGML_LOG_DEBUG("%s: operation %s not supported, falling back to CUDA\n",
+                                       __func__, ggml_op_name(node->op));
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    // Mark as network output
+                    char out_name[64];
+                    snprintf(out_name, sizeof(out_name), "output_%p", (void*)node);
+                    net_builder.mark_output(output, out_name);
+                    break;
+            }
+        }
+
+        // Step 5: Build TensorRT engine
+        EngineConfig engine_config;
+        engine_config.max_workspace_size = 1024 * 1024 * 1024;  // 1 GB
+        engine_config.use_fp16 = false;  // Disabled: TensorRT-RTX strongly-typed mode doesn't support deprecated kFP16 flag
+
+        EngineManager engine_mgr(ctx->runtime.get(), ctx->logger.get());
+        nvinfer1::ICudaEngine* engine = engine_mgr.build_engine(network.get(), engine_config);
+        if (!engine) {
+            GGML_LOG_ERROR("%s: failed to build TensorRT engine\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+
+        // Step 6: Create execution context
+        nvinfer1::IExecutionContext* exec_ctx = engine_mgr.create_context(engine);
+        if (!exec_ctx) {
+            GGML_LOG_ERROR("%s: failed to create execution context\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+
+        // Step 7: Set tensor addresses for inputs
+        for (const ggml_tensor* leaf : leaf_tensors) {
+            char name[64];
+            snprintf(name, sizeof(name), "input_%p", (void*)leaf);
+            if (!exec_ctx->setTensorAddress(name, leaf->data)) {
+                GGML_LOG_ERROR("%s: failed to set input tensor address for %s\n", __func__, name);
+                return GGML_STATUS_FAILED;
+            }
+        }
+
+        // Step 8: Set tensor addresses for outputs
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node->op != GGML_OP_NONE && node->op != GGML_OP_VIEW &&
+                node->op != GGML_OP_RESHAPE && node->op != GGML_OP_PERMUTE &&
+                node->op != GGML_OP_TRANSPOSE && node->op != GGML_OP_CPY &&
+                node->op != GGML_OP_DUP && node->op != GGML_OP_CONT) {
+
+                char name[64];
+                snprintf(name, sizeof(name), "output_%p", (void*)node);
+                if (!exec_ctx->setTensorAddress(name, node->data)) {
+                    GGML_LOG_ERROR("%s: failed to set output tensor address for %s\n", __func__, name);
+                    return GGML_STATUS_FAILED;
+                }
+            }
+        }
+
+        // Step 9: Execute inference
+        if (!exec_ctx->enqueueV3(ctx->stream)) {
+            GGML_LOG_ERROR("%s: failed to execute TensorRT engine\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+
+    } catch (const std::exception& e) {
+        GGML_LOG_ERROR("%s: exception: %s\n", __func__, e.what());
+        return GGML_STATUS_FAILED;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -512,8 +619,28 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
             break;
     }
 
-    // For now, we don't support compute operations
-    // This will be implemented in Milestone 2-4
+    // Milestone 2: Core operations
+    switch (op->op) {
+        // Matrix multiplication
+        case GGML_OP_MUL_MAT:
+            return true;
+
+        // Elementwise operations
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_SUB:
+        case GGML_OP_DIV:
+            return true;
+
+        // Normalization operations
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_GROUP_NORM:
+            return true;
+
+        default:
+            break;
+    }
+
     return false;
 }
 
