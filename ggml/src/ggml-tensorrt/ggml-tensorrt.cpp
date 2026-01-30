@@ -461,12 +461,23 @@ static ggml_backend_buffer_t ggml_backend_tensorrt_device_buffer_from_host_ptr(g
 static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     (void) dev;
 
-    // Support GGML_OP_NONE (storage tensors like KV cache)
-    if (op->op == GGML_OP_NONE) {
-        return true;
+    // Support storage and view operations (used for KV cache management)
+    switch (op->op) {
+        case GGML_OP_NONE:       // Storage tensors
+        case GGML_OP_VIEW:       // Tensor views
+        case GGML_OP_RESHAPE:    // Reshape (no data copy)
+        case GGML_OP_PERMUTE:    // Permute dimensions
+        case GGML_OP_TRANSPOSE:  // Transpose
+        case GGML_OP_CPY:        // Copy operations
+        case GGML_OP_DUP:        // Duplicate
+        case GGML_OP_CONT:       // Make contiguous
+        case GGML_OP_SET_ROWS:   // Set rows (used by KV cache)
+            return true;
+        default:
+            break;
     }
 
-    // For now, we don't support any compute operations
+    // For now, we don't support compute operations
     // This will be implemented in Milestone 2-4
     return false;
 }
