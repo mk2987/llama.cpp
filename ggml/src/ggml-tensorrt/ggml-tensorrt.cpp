@@ -397,20 +397,20 @@ ggml_backend_t ggml_backend_tensorrt_init(int device) {
 
 static const char * ggml_backend_tensorrt_device_get_name(ggml_backend_dev_t dev) {
     int device_index = (int)(intptr_t)dev->context;
-    static char name[128];
+    static char name[512];
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device_index);
-    snprintf(name, sizeof(name), "%s (TensorRT-RTX)", prop.name);
+    snprintf(name, sizeof(name), "%.480s (TensorRT-RTX)", prop.name);
     return name;
 }
 
 static const char * ggml_backend_tensorrt_device_get_description(ggml_backend_dev_t dev) {
     int device_index = (int)(intptr_t)dev->context;
-    static char description[256];
+    static char description[512];
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device_index);
     snprintf(description, sizeof(description),
-             "%s (TensorRT-RTX) - Compute Capability %d.%d",
+             "%.448s (TensorRT-RTX) - Compute Capability %d.%d",
              prop.name, prop.major, prop.minor);
     return description;
 }
@@ -460,10 +460,14 @@ static ggml_backend_buffer_t ggml_backend_tensorrt_device_buffer_from_host_ptr(g
 
 static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     (void) dev;
-    (void) op;
 
-    // For now, we don't support any operations
-    // This will be implemented in Milestone 4
+    // Support GGML_OP_NONE (storage tensors like KV cache)
+    if (op->op == GGML_OP_NONE) {
+        return true;
+    }
+
+    // For now, we don't support any compute operations
+    // This will be implemented in Milestone 2-4
     return false;
 }
 
