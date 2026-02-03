@@ -36,19 +36,16 @@ nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* no
     auto* network = builder->get_network();
 
     // GGML MUL_MAT operation: C = A @ B
-    // A has shape [K, M, ...] (note: GGML stores dimensions in reverse)
+    // A has shape [K, M, ...]
     // B has shape [K, N, ...]
-    // C has shape [M, N, ...]
+    // C has shape [N, M, ...] ← NOTE: Output is [N, M], not [M, N]!
     //
     // In GGML:
     // - src0->ne[0] = K, src0->ne[1] = M
     // - src1->ne[0] = K, src1->ne[1] = N
-    // - dst->ne[0] = M, dst->ne[1] = N
+    // - dst->ne[0] = N, dst->ne[1] = M  ← Swapped compared to mathematical notation!
     //
-    // TensorRT MatrixMultiply expects:
-    // - Input0: [..., K, M] or [..., M, K] with transpose
-    // - Input1: [..., K, N] or [..., N, K] with transpose
-    // - Output: [..., M, N]
+    // This is GGML's convention for matrix multiply
 
     // Get dimensions
     nvinfer1::Dims dims0 = trt_src0->getDimensions();
@@ -61,17 +58,21 @@ nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* no
 
     // For basic 2D matrix multiplication:
     // GGML stores matrices as [K, M] and [K, N]
-    // We need to transpose the first matrix to get [M, K]
-    // Then multiply [M, K] @ [K, N] = [M, N]
+    // GGML's mul_mat(src0, src1) produces output with shape [N, M] (note the order!)
+    //
+    // To achieve this with TensorRT:
+    // We compute: transpose(src1) @ src0
+    // - src1 [K, N] transposed becomes [N, K]
+    // - src0 [K, M] stays as [K, M]
+    // - [N, K] @ [K, M] = [N, M] ✓
 
     // Add MatrixMultiply layer
-    // op0 controls transposition of first input
-    // op1 controls transposition of second input
+    // Note: swapped input order and transpose operations for GGML semantics
     auto* layer = network->addMatrixMultiply(
-        *trt_src0,
-        nvinfer1::MatrixOperation::kTRANSPOSE, // Transpose first matrix
-        *trt_src1,
-        nvinfer1::MatrixOperation::kNONE       // Don't transpose second matrix
+        *trt_src1,                             // Use src1 first (swapped!)
+        nvinfer1::MatrixOperation::kTRANSPOSE, // Transpose src1: [K,N] -> [N,K]
+        *trt_src0,                             // Use src0 second (swapped!)
+        nvinfer1::MatrixOperation::kNONE       // Keep src0 as [K,M]
     );
 
     if (layer == nullptr) {
