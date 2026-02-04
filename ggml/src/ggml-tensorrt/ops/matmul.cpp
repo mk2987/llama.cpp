@@ -37,13 +37,13 @@ nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* no
 
     // GGML MUL_MAT operation: C = A @ B
     // A has shape [K, M, ...]
-    // B has shape [K, N, ...]
-    // C has shape [N, M, ...] ← NOTE: Output is [N, M], not [M, N]!
+    // B has shape [K, N, ...] ← NOTE: Shape is [K, N], not [N, K]!
+    // C has shape [N, M, ...]
     //
     // In GGML:
     // - src0->ne[0] = K, src0->ne[1] = M
     // - src1->ne[0] = K, src1->ne[1] = N
-    // - dst->ne[0] = N, dst->ne[1] = M  ← Swapped compared to mathematical notation!
+    // - dst->ne[0] = N, dst->ne[1] = M
     //
     // This is GGML's convention for matrix multiply
 
@@ -57,22 +57,36 @@ nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* no
         dims_to_string(dims1).c_str());
 
     // For basic 2D matrix multiplication:
-    // GGML stores matrices as [K, M] and [K, N]
-    // GGML's mul_mat(src0, src1) produces output with shape [N, M] (note the order!)
+    // GGML specification: A @ B^T (B is transposed internally)
     //
-    // To achieve this with TensorRT:
-    // We compute: transpose(src1) @ src0
-    // - src1 [K, N] transposed becomes [N, K]
-    // - src0 [K, M] stays as [K, M]
-    // - [N, K] @ [K, M] = [N, M] ✓
+    // From ggml.h:
+    // - A: k columns, n rows, stored as [k, m] → represents m×k matrix
+    // - B: k columns, m rows, stored as [k, n] → represents n×k matrix
+    // - Operation: A @ B^T = (m×k) @ (k×n) = m×n
+    //
+    // TensorRT interprets [k, n] as a k×n matrix, so:
+    // - trt_src0 [k, n] is k×n in TensorRT, but represents n×k in GGML
+    // - trt_src1 [k, m] is k×m in TensorRT, but represents m×k in GGML
+    //
+    // To compute A @ B^T with GGML semantics:
+    // - A (n×k) = transpose(trt_src0) where trt_src0 is (k×n)
+    // - B^T (k×m) = trt_src1 as-is (k×m)
+    // - A @ B^T = transpose(trt_src0) @ trt_src1 = (n×k) @ (k×m) = (n×m)
+    //
+    // TensorRT will output (n×m) which needs to be stored as [m, n] in GGML.
+    // But TensorRT outputs [n, m], so we need to transpose the result!
+    //
+    // Using (A @ B)^T = B^T @ A^T, we can compute (A @ B^T)^T = B @ A^T:
+    // - B @ A^T = transpose(trt_src1) @ trt_src0 = (m×k) @ (k×n) = (m×n)
+    // - TensorRT outputs [m, n] ✓ This is what GGML expects!
 
     // Add MatrixMultiply layer
-    // Note: swapped input order and transpose operations for GGML semantics
+    // Compute: B @ A^T = transpose(src1) @ src0
     auto* layer = network->addMatrixMultiply(
-        *trt_src1,                             // Use src1 first (swapped!)
-        nvinfer1::MatrixOperation::kTRANSPOSE, // Transpose src1: [K,N] -> [N,K]
-        *trt_src0,                             // Use src0 second (swapped!)
-        nvinfer1::MatrixOperation::kNONE       // Keep src0 as [K,M]
+        *trt_src1,                             // B: [k, m]
+        nvinfer1::MatrixOperation::kTRANSPOSE, // Transpose to [m, k]
+        *trt_src0,                             // A: [k, n] (used as A^T in math)
+        nvinfer1::MatrixOperation::kNONE       // Keep as [k, n]
     );
 
     if (layer == nullptr) {

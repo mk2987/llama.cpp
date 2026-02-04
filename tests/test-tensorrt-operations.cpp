@@ -102,6 +102,38 @@ static bool test_mul_mat() {
     ASSERT_TRUE(c->ne[0] == N);
     ASSERT_TRUE(c->ne[1] == M);
 
+    // Verify values: manually compute expected result for A @ B^T
+    // A is M×K (3×4), B is N×K (2×4)
+    // A @ B^T = (3×4) @ (4×2) = (3×2)
+    // Result is stored as [N, M] = [2, 3]
+    //
+    // A stored as [K,M]=[4,3] means 3 rows, each with 4 elements:
+    // A[0,:] = [0,1,2,3], A[1,:] = [4,5,6,7], A[2,:] = [8,9,0,1]
+    //
+    // B stored as [K,N]=[4,2] means 2 rows, each with 4 elements:
+    // B[0,:] = [1,2,3,4], B[1,:] = [2,3,4,5]
+    //
+    // A @ B^T:
+    // result[0,0] = A[0,:]·B[0,:] = 0*1 + 1*2 + 2*3 + 3*4 = 20
+    // result[0,1] = A[0,:]·B[1,:] = 0*2 + 1*3 + 2*4 + 3*5 = 26
+    // result[1,0] = A[1,:]·B[0,:] = 4*1 + 5*2 + 6*3 + 7*4 = 60
+    // result[1,1] = A[1,:]·B[1,:] = 4*2 + 5*3 + 6*4 + 7*5 = 82
+    // result[2,0] = A[2,:]·B[0,:] = 8*1 + 9*2 + 0*3 + 1*4 = 30
+    // result[2,1] = A[2,:]·B[1,:] = 8*2 + 9*3 + 0*4 + 1*5 = 48
+    //
+    // Stored as [N,M]=[2,3] with N columns, M rows (row-major with ne[0] fast):
+    // [row0_col0, row0_col1, row1_col0, row1_col1, row2_col0, row2_col1]
+    // = [20, 26, 60, 82, 30, 48]
+    float expected[6] = {20.0f, 26.0f, 60.0f, 82.0f, 30.0f, 48.0f};
+    for (int i = 0; i < 6; i++) {
+        float diff = fabs(c_result[i] - expected[i]);
+        if (diff > 1e-4f) {
+            fprintf(stderr, "Value mismatch at index %d: got %.2f, expected %.2f\n",
+                    i, c_result[i], expected[i]);
+            return false;
+        }
+    }
+
     printf("MUL_MAT test passed!\n");
 
     // Cleanup
