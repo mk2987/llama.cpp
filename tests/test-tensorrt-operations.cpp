@@ -58,8 +58,8 @@ static bool test_mul_mat() {
     ASSERT_TRUE(backend_trt != NULL);
 
     // Create test tensors: C = A @ B
-    // A: [K, M] = [4, 3]
-    // B: [K, N] = [4, 2]
+    // A: [M, K] = [3, 4] (rows, columns)
+    // B: [N, K] = [2, 4] (rows, columns, is transposed internally by TRT)
     // C: [M, N] = [3, 2]
     const int64_t K = 4, M = 3, N = 2;
 
