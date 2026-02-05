@@ -23,10 +23,12 @@ nvinfer1::Dims ggml_tensor_to_dims(const ggml_tensor* tensor) {
     GGML_ASSERT(n_dims <= nvinfer1::Dims::MAX_DIMS);
 
     // Convert dimensions from GGML to TensorRT
-    // Note: GGML dimensions are stored in reverse order compared to typical layout
-    // GGML: [ne0, ne1, ne2, ne3] where ne0 is the fastest changing dimension
+    // GGML dimensions are stored in reverse order:
+    // GGML: [ne0, ne1, ne2, ne3] where ne0=cols, ne1=rows (fastest to slowest)
+    // TensorRT expects: [rows, cols, ...] (standard layout)
+    // Therefore we must REVERSE the dimension order
     for (int i = 0; i < n_dims; ++i) {
-        dims.d[i] = tensor->ne[i];
+        dims.d[i] = tensor->ne[n_dims - 1 - i];
     }
     dims.nbDims = n_dims;
 
@@ -37,8 +39,9 @@ void dims_to_ggml_shape(const nvinfer1::Dims& dims, int64_t* shape) {
     GGML_ASSERT(shape != nullptr);
     GGML_ASSERT(dims.nbDims >= 0 && dims.nbDims <= nvinfer1::Dims::MAX_DIMS);
 
+    // Reverse dimensions back to GGML convention
     for (int i = 0; i < dims.nbDims; ++i) {
-        shape[i] = dims.d[i];
+        shape[i] = dims.d[dims.nbDims - 1 - i];
     }
 }
 
