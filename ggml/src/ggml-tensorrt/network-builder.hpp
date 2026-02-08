@@ -2,9 +2,11 @@
 
 #include "common.hpp"
 #include <NvInfer.h>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <memory>
+#include <vector>
 
 namespace ggml_tensorrt {
 
@@ -60,6 +62,15 @@ public:
     // Register an operation handler
     static void register_op_handler(ggml_op op, OpHandler handler);
 
+    // Create a constant tensor with persistent weight storage.
+    // The data is copied internally so the caller's pointer need not
+    // outlive this call.
+    nvinfer1::ITensor* create_constant_tensor(
+        const void* data,
+        nvinfer1::Dims dims,
+        nvinfer1::DataType dtype
+    );
+
 private:
     nvinfer1::INetworkDefinition* network_;
     nvinfer1::ILogger* logger_;
@@ -69,6 +80,11 @@ private:
 
     // Static map of operation handlers
     static std::map<ggml_op, OpHandler> op_handlers_;
+
+    // Persistent storage for weight data passed to TensorRT constant layers.
+    // TensorRT does not copy weight data — pointers must remain valid for the
+    // lifetime of the INetworkDefinition.
+    std::vector<std::vector<uint8_t>> weight_storage_;
 };
 
 // Operation handler declarations
@@ -86,13 +102,5 @@ nvinfer1::ITensor* handle_div(NetworkBuilder* builder, const ggml_tensor* node);
 // Normalization operations
 nvinfer1::ITensor* handle_rms_norm(NetworkBuilder* builder, const ggml_tensor* node);
 nvinfer1::ITensor* handle_group_norm(NetworkBuilder* builder, const ggml_tensor* node);
-
-// Utility: Create a constant tensor
-nvinfer1::ITensor* create_constant_tensor(
-    nvinfer1::INetworkDefinition* network,
-    const void* data,
-    nvinfer1::Dims dims,
-    nvinfer1::DataType dtype
-);
 
 } // namespace ggml_tensorrt

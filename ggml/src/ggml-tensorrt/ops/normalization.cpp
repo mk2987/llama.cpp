@@ -79,8 +79,8 @@ nvinfer1::ITensor* handle_rms_norm(NetworkBuilder* builder, const ggml_tensor* n
     scalar_dims.nbDims = 1;
     scalar_dims.d[0] = 1;
 
-    auto* eps_tensor = create_constant_tensor(
-        network, &eps, scalar_dims, nvinfer1::DataType::kFLOAT);
+    auto* eps_tensor = builder->create_constant_tensor(
+        &eps, scalar_dims, nvinfer1::DataType::kFLOAT);
     if (eps_tensor == nullptr) {
         GGML_LOG_ERROR("%s: failed to create epsilon tensor\n", __func__);
         return nullptr;
@@ -180,10 +180,10 @@ nvinfer1::ITensor* handle_group_norm(NetworkBuilder* builder, const ggml_tensor*
     scale_dims.nbDims = 1;
     scale_dims.d[0] = channel_dim;
 
-    nvinfer1::ITensor* scale_tensor = create_constant_tensor(
-        network, scale_data.data(), scale_dims, nvinfer1::DataType::kFLOAT);
-    nvinfer1::ITensor* bias_tensor = create_constant_tensor(
-        network, bias_data.data(), scale_dims, nvinfer1::DataType::kFLOAT);
+    nvinfer1::ITensor* scale_tensor = builder->create_constant_tensor(
+        scale_data.data(), scale_dims, nvinfer1::DataType::kFLOAT);
+    nvinfer1::ITensor* bias_tensor = builder->create_constant_tensor(
+        bias_data.data(), scale_dims, nvinfer1::DataType::kFLOAT);
 
     if (scale_tensor == nullptr || bias_tensor == nullptr) {
         GGML_LOG_ERROR("%s: failed to create scale/bias tensors\n", __func__);

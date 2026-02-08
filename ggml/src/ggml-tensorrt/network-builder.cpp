@@ -146,14 +146,25 @@ void NetworkBuilder::register_op_handler(ggml_op op, OpHandler handler) {
     op_handlers_[op] = handler;
 }
 
-// Utility: Create a constant tensor
-nvinfer1::ITensor* create_constant_tensor(
-    nvinfer1::INetworkDefinition* network,
+static size_t tensorrt_dtype_size(nvinfer1::DataType dtype) {
+    switch (dtype) {
+        case nvinfer1::DataType::kFLOAT: return 4;
+        case nvinfer1::DataType::kHALF:  return 2;
+        case nvinfer1::DataType::kINT8:  return 1;
+        case nvinfer1::DataType::kINT32: return 4;
+        case nvinfer1::DataType::kBOOL:  return 1;
+        case nvinfer1::DataType::kBF16:  return 2;
+        case nvinfer1::DataType::kFP8:   return 1;
+        case nvinfer1::DataType::kINT64: return 8;
+        default:                         return 4;
+    }
+}
+
+nvinfer1::ITensor* NetworkBuilder::create_constant_tensor(
     const void* data,
     nvinfer1::Dims dims,
     nvinfer1::DataType dtype
 ) {
-    GGML_ASSERT(network != nullptr);
     GGML_ASSERT(data != nullptr);
 
     // Calculate total number of elements
@@ -162,11 +173,18 @@ nvinfer1::ITensor* create_constant_tensor(
         numel *= dims.d[i];
     }
 
-    // Create weights
-    nvinfer1::Weights weights{dtype, data, numel};
+    // Copy weight data into persistent storage.
+    // TensorRT does not copy weights — the pointer passed via
+    // nvinfer1::Weights must remain valid for the lifetime of
+    // the INetworkDefinition (i.e. until the engine is built).
+    size_t nbytes = static_cast<size_t>(numel) * tensorrt_dtype_size(dtype);
+    weight_storage_.emplace_back(nbytes);
+    memcpy(weight_storage_.back().data(), data, nbytes);
+
+    nvinfer1::Weights weights{dtype, weight_storage_.back().data(), numel};
 
     // Add constant layer
-    nvinfer1::IConstantLayer* layer = network->addConstant(dims, weights);
+    nvinfer1::IConstantLayer* layer = network_->addConstant(dims, weights);
     if (layer == nullptr) {
         GGML_LOG_ERROR("%s: failed to create constant layer\n", __func__);
         return nullptr;
