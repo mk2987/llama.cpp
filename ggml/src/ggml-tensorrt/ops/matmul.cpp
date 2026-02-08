@@ -9,7 +9,7 @@
 namespace ggml_tensorrt {
 
 // Handle matrix multiplication (MUL_MAT)
-// GGML MUL_MAT: C = A @ B
+// GGML MUL_MAT: C = B @ A^T
 // Where A is src0 and B is src1
 nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* node) {
     GGML_ASSERT(builder != nullptr);
@@ -36,13 +36,13 @@ nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* no
     auto* network = builder->get_network();
 
     // GGML MUL_MAT operation: C = A @ B
-    // A has shape [K, M, ...] (K is the innermost dimension)
-    // B has shape [K, N, ...] (Needs to be transposed by TensorRT)
+    // A has shape [K, N, ...] (K is the innermost dimension)
+    // B has shape [K, M, ...] (Needs to be transposed by TensorRT)
     // C has shape [N, M, ...]
     //
     // In GGML:
-    // - src0->ne[0] = K, src0->ne[1] = M
-    // - src1->ne[0] = K, src1->ne[1] = N
+    // - src0->ne[0] = K, src0->ne[1] = N
+    // - src1->ne[0] = K, src1->ne[1] = M
     // - dst->ne[0] = N, dst->ne[1] = M
     //
     // This is GGML's convention for matrix multiply
@@ -60,16 +60,16 @@ nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* no
     // GGML specification: A @ B^T (B is transposed internally)
     //
     // From ggml.h:
-    // - A: k columns, n rows, stored as [k, m] → represents m×k matrix
-    // - B: k columns, m rows, stored as [k, n] → represents n×k matrix
-    // - Operation: A @ B^T = (m×k) @ (k×n) = m×n
+    // - A: k columns, n rows, stored as [k, n] → represents m×k matrix
+    // - B: k columns, m rows, stored as [k, m] → represents n×k matrix
+    // - Operation: B @ A^T = (m×k) @ (k×n) = m×n
 
     // Add MatrixMultiply layer
     // Compute: B @ A^T = transpose(src1) @ src0
     auto* layer = network->addMatrixMultiply(
-        *trt_src0,                             // A: [K, M, ...]
+        *trt_src1,                             // B: [K, M, ...]
         nvinfer1::MatrixOperation::kNONE,
-        *trt_src1,                             // B: [K, N, ...]
+        *trt_src0,                             // B: [K, N, ...]
         nvinfer1::MatrixOperation::kTRANSPOSE  // Transpose to [N, K, ...]
     );
 
