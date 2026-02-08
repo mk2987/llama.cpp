@@ -57,24 +57,24 @@ static bool test_mul_mat() {
     ggml_backend_t backend_trt = ggml_backend_tensorrt_init(0);
     ASSERT_TRUE(backend_trt != NULL);
 
-    // Create test tensors: C = A @ B
-    // A: [M, K] = [3, 4] (rows, columns)
-    // B: [N, K] = [2, 4] (rows, columns, is transposed internally by TRT)
+    // Create test tensors: C = B @ A^T
+    // A: [N, K] = [3, 4] (rows, columns)
+    // B: [M, K] = [2, 4]
     // C: [M, N] = [3, 2]
-    const int64_t K = 4, M = 3, N = 2;
+    const int64_t K = 4, N = 3, M = 2;
 
-    struct ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
-    struct ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    struct ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    struct ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
 
     // Prepare test data in temporary arrays
-    std::vector<float> a_data(K * M);
-    std::vector<float> b_data(K * N);
+    std::vector<float> a_data(K * N);
+    std::vector<float> b_data(K * M);
 
-    for (int64_t i = 0; i < K * M; ++i) {
+    for (int64_t i = 0; i < K * N; ++i) {
         a_data[i] = (float)(i % 10);
     }
 
-    for (int64_t i = 0; i < K * N; ++i) {
+    for (int64_t i = 0; i < K * M; ++i) {
         b_data[i] = (float)((i % 5) + 1);
     }
 
@@ -103,28 +103,16 @@ static bool test_mul_mat() {
     ASSERT_TRUE(c->ne[1] == M);
 
     // Verify values: manually compute expected result for A @ B^T
-    // A is M×K (3×4), B is N×K (2×4)
-    // A @ B^T = (3×4) @ (4×2) = (3×2)
-    // Result is stored as [N, M] = [2, 3]
+    // a = np.array([[0, 1, 2, 3],
+    //        [4, 5, 6, 7],
+    //        [8, 9, 0, 1]])
     //
-    // A stored as [K,M]=[4,3] means 3 rows, each with 4 elements:
-    // A[0,:] = [0,1,2,3], A[1,:] = [4,5,6,7], A[2,:] = [8,9,0,1]
+    // b = np.array([[1, 2, 3, 4],
+    //        [5, 1, 2, 3]])
     //
-    // B stored as [K,N]=[4,2] means 2 rows, each with 4 elements:
-    // B[0,:] = [1,2,3,4], B[1,:] = [2,3,4,5]
-    //
-    // A @ B^T:
-    // result[0,0] = A[0,:]·B[0,:] = 0*1 + 1*2 + 2*3 + 3*4 = 20
-    // result[0,1] = A[0,:]·B[1,:] = 0*2 + 1*3 + 2*4 + 3*5 = 26
-    // result[1,0] = A[1,:]·B[0,:] = 4*1 + 5*2 + 6*3 + 7*4 = 60
-    // result[1,1] = A[1,:]·B[1,:] = 4*2 + 5*3 + 6*4 + 7*5 = 82
-    // result[2,0] = A[2,:]·B[0,:] = 8*1 + 9*2 + 0*3 + 1*4 = 30
-    // result[2,1] = A[2,:]·B[1,:] = 8*2 + 9*3 + 0*4 + 1*5 = 48
-    //
-    // Stored as [N,M]=[2,3] with N columns, M rows (row-major with ne[0] fast):
-    // [row0_col0, row0_col1, row1_col0, row1_col1, row2_col0, row2_col1]
-    // = [20, 26, 60, 82, 30, 48]
-    float expected[6] = {20.0f, 26.0f, 60.0f, 82.0f, 30.0f, 48.0f};
+    // c = np.array([[20, 60, 30],
+    //        [14, 58, 52]])
+    float expected[6] = {20.0f, 60.0f, 30.0f, 14.0f, 58.0f, 52.0f};
     for (int i = 0; i < 6; i++) {
         float diff = fabs(c_result[i] - expected[i]);
         if (diff > 1e-4f) {
