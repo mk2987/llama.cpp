@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "engine-manager.hpp"
 #include "ggml-impl.h"
 
 #include <cstdio>
@@ -76,10 +77,18 @@ ggml_backend_tensorrt_context::ggml_backend_tensorrt_context(int device_id)
         GGML_ABORT("Failed to create TensorRT runtime");
     }
 
+    // Create engine manager
+    engine_mgr = std::make_unique<EngineManager>(runtime.get(), logger.get());
+
     GGML_LOG_INFO("%s: initialized TensorRT-RTX backend on device %d\n", __func__, device);
 }
 
 ggml_backend_tensorrt_context::~ggml_backend_tensorrt_context() {
+    // Reset in dependency order: engine_mgr uses runtime, runtime uses logger
+    engine_mgr.reset();
+    runtime.reset();
+    logger.reset();
+
     if (stream) {
         cudaStreamDestroy(stream);
         stream = nullptr;

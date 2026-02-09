@@ -5,6 +5,61 @@
 
 namespace ggml_tensorrt {
 
+// FNV-1a hash helpers
+static const uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+static const uint64_t FNV_PRIME        = 1099511628211ULL;
+
+static inline uint64_t fnv1a_hash_bytes(uint64_t hash, const void* data, size_t len) {
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= FNV_PRIME;
+    }
+    return hash;
+}
+
+template<typename T>
+static inline uint64_t fnv1a_hash_value(uint64_t hash, T value) {
+    return fnv1a_hash_bytes(hash, &value, sizeof(value));
+}
+
+uint64_t compute_graph_hash(const ggml_cgraph * cgraph) {
+    uint64_t hash = FNV_OFFSET_BASIS;
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        // Hash op type
+        hash = fnv1a_hash_value(hash, static_cast<int32_t>(node->op));
+
+        // Hash output data type
+        hash = fnv1a_hash_value(hash, static_cast<int32_t>(node->type));
+
+        // Hash output shape
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            hash = fnv1a_hash_value(hash, node->ne[d]);
+        }
+
+        // Hash op_params (all 16 int32 values)
+        hash = fnv1a_hash_bytes(hash, node->op_params, sizeof(node->op_params));
+
+        // Hash source tensor types and shapes (NOT pointers)
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                hash = fnv1a_hash_value(hash, static_cast<int32_t>(node->src[j]->type));
+                for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                    hash = fnv1a_hash_value(hash, node->src[j]->ne[d]);
+                }
+            } else {
+                // Sentinel for null source
+                hash = fnv1a_hash_value(hash, static_cast<int32_t>(-1));
+            }
+        }
+    }
+
+    return hash;
+}
+
 EngineManager::EngineManager(nvinfer1::IRuntime* runtime, nvinfer1::ILogger* logger)
     : runtime_(runtime), logger_(logger) {
     GGML_ASSERT(runtime_ != nullptr);
@@ -12,7 +67,8 @@ EngineManager::EngineManager(nvinfer1::IRuntime* runtime, nvinfer1::ILogger* log
 }
 
 EngineManager::~EngineManager() {
-    // Engines are managed by unique_ptr and will be automatically deleted
+    // Destroy execution contexts before engines (contexts reference engines)
+    context_cache_.clear();
     engine_cache_.clear();
 }
 
@@ -120,6 +176,35 @@ void EngineManager::cache_engine(uint64_t hash, nvinfer1::ICudaEngine* engine) {
 
     GGML_LOG_DEBUG("%s: cached engine with hash %llu\n", __func__,
                   static_cast<unsigned long long>(hash));
+}
+
+nvinfer1::IExecutionContext* EngineManager::get_or_create_context(uint64_t hash) {
+    // Check context cache first
+    auto it = context_cache_.find(hash);
+    if (it != context_cache_.end()) {
+        return it->second.get();
+    }
+
+    // Need a cached engine to create the context from
+    auto engine_it = engine_cache_.find(hash);
+    if (engine_it == engine_cache_.end()) {
+        GGML_LOG_ERROR("%s: no cached engine for hash %llu\n", __func__,
+                      static_cast<unsigned long long>(hash));
+        return nullptr;
+    }
+
+    nvinfer1::IExecutionContext* ctx = engine_it->second->createExecutionContext();
+    if (ctx == nullptr) {
+        GGML_LOG_ERROR("%s: failed to create execution context\n", __func__);
+        return nullptr;
+    }
+
+    context_cache_[hash] = std::unique_ptr<nvinfer1::IExecutionContext>(ctx);
+
+    GGML_LOG_DEBUG("%s: created and cached execution context for hash %llu\n", __func__,
+                  static_cast<unsigned long long>(hash));
+
+    return ctx;
 }
 
 void EngineManager::configure_builder(

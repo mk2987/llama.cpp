@@ -7,7 +7,6 @@
 #include <NvInfer.h>
 #include <cuda_runtime.h>
 
-#include <map>
 #include <memory>
 #include <string>
 
@@ -15,6 +14,10 @@
 namespace nvinfer1 {
     class IRuntime;
     class ILogger;
+}
+
+namespace ggml_tensorrt {
+    class EngineManager;
 }
 
 namespace ggml_tensorrt {
@@ -38,10 +41,7 @@ struct ggml_backend_tensorrt_context {
 
     std::unique_ptr<nvinfer1::IRuntime> runtime;
     std::unique_ptr<Logger> logger;
-
-    // Engine cache: maps graph hash to compiled engines
-    // Will be implemented in later milestones
-    // std::map<uint64_t, std::unique_ptr<nvinfer1::ICudaEngine>> engine_cache;
+    std::unique_ptr<EngineManager> engine_mgr;
 
     ggml_backend_tensorrt_context(int device);
     ~ggml_backend_tensorrt_context();
