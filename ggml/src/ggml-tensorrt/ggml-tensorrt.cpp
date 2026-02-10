@@ -378,6 +378,118 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
                 continue;
             }
 
+            // SET_ROWS — scatter F32 source rows into destination (KV cache)
+            // node      = view of destination (same data pointer as src[2])
+            // src[0]    = source rows (always F32)
+            // src[1]    = indices (I32 or I64)
+            // src[2]    = original destination tensor
+            case GGML_OP_SET_ROWS:
+            {
+                const ggml_tensor * src0 = node->src[0];  // source rows (F32)
+                const ggml_tensor * src1 = node->src[1];  // indices
+
+                const int64_t ne00 = src0->ne[0];  // row width
+                const int64_t ne01 = src0->ne[1];  // num rows per batch
+                const int64_t ne02 = src0->ne[2];  // batch dim 2
+                const int64_t ne03 = src0->ne[3];  // batch dim 3
+
+                const int64_t ne11 = src1->ne[1];
+                const int64_t ne12 = src1->ne[2];
+
+                // Synchronize stream before host-side index reads
+                CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+
+                // Copy index tensor to host
+                const size_t idx_bytes = ggml_nbytes(src1);
+                std::vector<uint8_t> idx_host(idx_bytes);
+
+                if (src1->buffer && ggml_backend_buffer_is_host(src1->buffer)) {
+                    memcpy(idx_host.data(), src1->data, idx_bytes);
+                } else {
+                    CUDA_CHECK(cudaMemcpy(idx_host.data(), src1->data, idx_bytes, cudaMemcpyDeviceToHost));
+                }
+
+                // Helper to read an index value from the host copy
+                const bool idx_i64 = (src1->type == GGML_TYPE_I64);
+                auto read_idx = [&](size_t byte_offset) -> int64_t {
+                    if (idx_i64) {
+                        int64_t v;
+                        memcpy(&v, idx_host.data() + byte_offset, sizeof(int64_t));
+                        return v;
+                    } else {
+                        int32_t v;
+                        memcpy(&v, idx_host.data() + byte_offset, sizeof(int32_t));
+                        return (int64_t)v;
+                    }
+                };
+
+                const size_t src_row_bytes = ne00 * sizeof(float);
+                const size_t dst_row_bytes = ggml_row_size(node->type, ne00);
+                const bool need_convert = (node->type != GGML_TYPE_F32);
+
+                // Temp host buffers for type conversion (allocated once, reused)
+                std::vector<float>   host_f32;
+                std::vector<uint8_t> host_cvt;
+                if (need_convert) {
+                    host_f32.resize(ne00);
+                    host_cvt.resize(dst_row_bytes);
+                }
+
+                for (int64_t i03 = 0; i03 < ne03; ++i03) {
+                    for (int64_t i02 = 0; i02 < ne02; ++i02) {
+                        for (int64_t i01 = 0; i01 < ne01; ++i01) {
+                            const int64_t i12 = i03 % ne12;
+                            const int64_t i11 = i02 % ne11;
+                            const int64_t i10 = i01;
+
+                            // Index byte offset using src1 strides
+                            const size_t idx_off = i10 * src1->nb[0]
+                                                 + i11 * src1->nb[1]
+                                                 + i12 * src1->nb[2];
+                            const int64_t dst_row = read_idx(idx_off);
+
+                            // Source pointer (src0 strides)
+                            const char * src_ptr = (const char *)src0->data
+                                + i01 * src0->nb[1]
+                                + i02 * src0->nb[2]
+                                + i03 * src0->nb[3];
+
+                            // Destination pointer (node strides)
+                            char * dst_ptr = (char *)node->data
+                                + dst_row * node->nb[1]
+                                + i02     * node->nb[2]
+                                + i03     * node->nb[3];
+
+                            if (!need_convert) {
+                                // F32 → F32: device-to-device copy
+                                CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, src_row_bytes,
+                                                           cudaMemcpyDeviceToDevice, ctx->stream));
+                            } else {
+                                // F32 → F16/BF16: copy to host, convert, copy back
+                                CUDA_CHECK(cudaMemcpy(host_f32.data(), src_ptr, src_row_bytes,
+                                                      cudaMemcpyDeviceToHost));
+
+                                if (node->type == GGML_TYPE_F16) {
+                                    ggml_fp32_to_fp16_row(host_f32.data(),
+                                                          (ggml_fp16_t *)host_cvt.data(), ne00);
+                                } else if (node->type == GGML_TYPE_BF16) {
+                                    ggml_fp32_to_bf16_row(host_f32.data(),
+                                                          (ggml_bf16_t *)host_cvt.data(), ne00);
+                                } else {
+                                    GGML_LOG_ERROR("%s: SET_ROWS unsupported dst type %s\n",
+                                                   __func__, ggml_type_name(node->type));
+                                    return GGML_STATUS_FAILED;
+                                }
+
+                                CUDA_CHECK(cudaMemcpy(dst_ptr, host_cvt.data(), dst_row_bytes,
+                                                      cudaMemcpyHostToDevice));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
             default:
             {
                 // Shape ops and compute ops both go into TRT node list
@@ -682,6 +794,7 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
+        case GGML_OP_SET_ROWS:
             return true;
         default:
             break;
