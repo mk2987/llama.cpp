@@ -99,15 +99,8 @@ nvinfer1::ITensor* handle_unary(NetworkBuilder* builder, const ggml_tensor* node
 
             // x / sqrt(2)
             float inv_sqrt2 = 1.0f / sqrtf(2.0f);
-            nvinfer1::Dims src_dims = trt_src->getDimensions();
-            nvinfer1::Dims scalar_dims;
-            scalar_dims.nbDims = src_dims.nbDims;
-            for (int i = 0; i < src_dims.nbDims; i++) {
-                scalar_dims.d[i] = 1;
-            }
 
-            nvinfer1::ITensor* scale_tensor = builder->create_constant_tensor(
-                &inv_sqrt2, scalar_dims, nvinfer1::DataType::kFLOAT);
+            nvinfer1::ITensor* scale_tensor = builder->create_typed_scalar(inv_sqrt2, trt_src);
             if (scale_tensor == nullptr) {
                 GGML_LOG_ERROR("%s: failed to create scale constant for GELU\n", __func__);
                 return nullptr;
@@ -130,9 +123,7 @@ nvinfer1::ITensor* handle_unary(NetworkBuilder* builder, const ggml_tensor* node
             nvinfer1::ITensor* erf_out = erf_layer->getOutput(0);
 
             // 1 + erf(...)
-            float one = 1.0f;
-            nvinfer1::ITensor* one_tensor = builder->create_constant_tensor(
-                &one, scalar_dims, nvinfer1::DataType::kFLOAT);
+            nvinfer1::ITensor* one_tensor = builder->create_typed_scalar(1.0f, trt_src);
             if (one_tensor == nullptr) {
                 GGML_LOG_ERROR("%s: failed to create one constant for GELU\n", __func__);
                 return nullptr;
@@ -147,9 +138,7 @@ nvinfer1::ITensor* handle_unary(NetworkBuilder* builder, const ggml_tensor* node
             nvinfer1::ITensor* one_plus_erf = add_layer->getOutput(0);
 
             // 0.5 * (1 + erf(...))
-            float half = 0.5f;
-            nvinfer1::ITensor* half_tensor = builder->create_constant_tensor(
-                &half, scalar_dims, nvinfer1::DataType::kFLOAT);
+            nvinfer1::ITensor* half_tensor = builder->create_typed_scalar(0.5f, trt_src);
             if (half_tensor == nullptr) {
                 GGML_LOG_ERROR("%s: failed to create half constant for GELU\n", __func__);
                 return nullptr;

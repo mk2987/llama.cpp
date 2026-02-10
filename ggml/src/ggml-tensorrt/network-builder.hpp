@@ -71,6 +71,21 @@ public:
         nvinfer1::DataType dtype
     );
 
+    // Create a scalar constant matching the type and rank of a reference tensor.
+    // Converts the float value to the appropriate format (FP32/FP16/BF16).
+    // Dims are all-ones matching the reference tensor's number of dimensions.
+    nvinfer1::ITensor* create_typed_scalar(
+        float value,
+        nvinfer1::ITensor* reference_tensor
+    );
+
+    // Insert a cast layer if the tensor type does not match the target type.
+    // Returns the original tensor unchanged if types already match.
+    nvinfer1::ITensor* maybe_cast(
+        nvinfer1::ITensor* tensor,
+        nvinfer1::DataType target_type
+    );
+
 private:
     nvinfer1::INetworkDefinition* network_;
     nvinfer1::ILogger* logger_;

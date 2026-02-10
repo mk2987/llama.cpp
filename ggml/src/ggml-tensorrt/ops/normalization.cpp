@@ -29,6 +29,11 @@ nvinfer1::ITensor* handle_rms_norm(NetworkBuilder* builder, const ggml_tensor* n
     }
 
     auto* network = builder->get_network();
+
+    // Save original type and upcast to FP32 for numerical stability
+    nvinfer1::DataType input_type = trt_src->getType();
+    trt_src = builder->maybe_cast(trt_src, nvinfer1::DataType::kFLOAT);
+
     nvinfer1::Dims dims = trt_src->getDimensions();
 
     // Get epsilon from operation parameters
@@ -119,6 +124,9 @@ nvinfer1::ITensor* handle_rms_norm(NetworkBuilder* builder, const ggml_tensor* n
     std::string layer_name = "rms_norm_" + std::to_string(reinterpret_cast<uintptr_t>(node));
     div_layer->setName(layer_name.c_str());
 
+    // Cast back to original type if needed
+    output = builder->maybe_cast(output, input_type);
+
     GGML_LOG_DEBUG("%s: created RMS_NORM layer, output shape %s\n",
         __func__, dims_to_string(output->getDimensions()).c_str());
 
@@ -144,6 +152,11 @@ nvinfer1::ITensor* handle_group_norm(NetworkBuilder* builder, const ggml_tensor*
     }
 
     auto* network = builder->get_network();
+
+    // Save original type and upcast to FP32 for numerical stability
+    nvinfer1::DataType input_type = trt_src->getType();
+    trt_src = builder->maybe_cast(trt_src, nvinfer1::DataType::kFLOAT);
+
     nvinfer1::Dims dims = trt_src->getDimensions();
 
     // Get number of groups and epsilon from operation parameters
@@ -216,6 +229,9 @@ nvinfer1::ITensor* handle_group_norm(NetworkBuilder* builder, const ggml_tensor*
     norm_layer->setName(layer_name.c_str());
 
     nvinfer1::ITensor* output = norm_layer->getOutput(0);
+
+    // Cast back to original type if needed
+    output = builder->maybe_cast(output, input_type);
 
     GGML_LOG_DEBUG("%s: created GROUP_NORM layer, output shape %s\n",
         __func__, dims_to_string(output->getDimensions()).c_str());

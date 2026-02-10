@@ -193,4 +193,57 @@ nvinfer1::ITensor* NetworkBuilder::create_constant_tensor(
     return layer->getOutput(0);
 }
 
+nvinfer1::ITensor* NetworkBuilder::create_typed_scalar(
+    float value,
+    nvinfer1::ITensor* reference_tensor
+) {
+    GGML_ASSERT(reference_tensor != nullptr);
+
+    nvinfer1::Dims ref_dims = reference_tensor->getDimensions();
+    nvinfer1::DataType dtype = reference_tensor->getType();
+
+    // Build scalar dims matching the reference tensor rank (all 1s)
+    nvinfer1::Dims scalar_dims;
+    scalar_dims.nbDims = ref_dims.nbDims;
+    for (int i = 0; i < ref_dims.nbDims; i++) {
+        scalar_dims.d[i] = 1;
+    }
+
+    switch (dtype) {
+        case nvinfer1::DataType::kFLOAT: {
+            return create_constant_tensor(&value, scalar_dims, nvinfer1::DataType::kFLOAT);
+        }
+        case nvinfer1::DataType::kHALF: {
+            ggml_fp16_t half_val = ggml_fp32_to_fp16(value);
+            return create_constant_tensor(&half_val, scalar_dims, nvinfer1::DataType::kHALF);
+        }
+        case nvinfer1::DataType::kBF16: {
+            ggml_bf16_t bf16_val = ggml_fp32_to_bf16(value);
+            return create_constant_tensor(&bf16_val, scalar_dims, nvinfer1::DataType::kBF16);
+        }
+        default:
+            GGML_LOG_ERROR("%s: unsupported dtype for scalar constant\n", __func__);
+            return nullptr;
+    }
+}
+
+nvinfer1::ITensor* NetworkBuilder::maybe_cast(
+    nvinfer1::ITensor* tensor,
+    nvinfer1::DataType target_type
+) {
+    GGML_ASSERT(tensor != nullptr);
+
+    if (tensor->getType() == target_type) {
+        return tensor;
+    }
+
+    nvinfer1::ICastLayer* cast = network_->addCast(*tensor, target_type);
+    if (cast == nullptr) {
+        GGML_LOG_ERROR("%s: failed to add cast layer\n", __func__);
+        return nullptr;
+    }
+
+    return cast->getOutput(0);
+}
+
 } // namespace ggml_tensorrt

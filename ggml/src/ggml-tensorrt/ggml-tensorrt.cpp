@@ -458,7 +458,6 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         // Build engine
         EngineConfig engine_config;
         engine_config.max_workspace_size = 1024ULL * 1024 * 1024;  // 1 GB
-        engine_config.use_fp16 = false;
 
         engine = ctx->engine_mgr->build_engine(network.get(), engine_config);
         if (!engine) {
@@ -653,6 +652,10 @@ static ggml_backend_buffer_t ggml_backend_tensorrt_device_buffer_from_host_ptr(g
     return nullptr;
 }
 
+static bool is_supported_compute_type(ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_BF16 || type == GGML_TYPE_F16;
+}
+
 static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     (void) dev;
 
@@ -671,7 +674,7 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
             break;
     }
 
-    // Compute ops — F32 only for correctness
+    // Compute ops — F32, BF16, F16
     switch (op->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_ADD:
@@ -682,13 +685,13 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_GROUP_NORM:
         case GGML_OP_SOFT_MAX:
         {
-            // Output must be F32
-            if (op->type != GGML_TYPE_F32) {
+            // Output must be a supported compute type
+            if (!is_supported_compute_type(op->type)) {
                 return false;
             }
-            // All sources must be F32
+            // All sources must be supported compute types
             for (int i = 0; i < GGML_MAX_SRC; i++) {
-                if (op->src[i] && op->src[i]->type != GGML_TYPE_F32) {
+                if (op->src[i] && !is_supported_compute_type(op->src[i]->type)) {
                     return false;
                 }
             }
@@ -707,13 +710,13 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
         }
         case GGML_OP_UNARY:
         {
-            // Output must be F32
-            if (op->type != GGML_TYPE_F32) {
+            // Output must be a supported compute type
+            if (!is_supported_compute_type(op->type)) {
                 return false;
             }
-            // All sources must be F32
+            // All sources must be supported compute types
             for (int i = 0; i < GGML_MAX_SRC; i++) {
-                if (op->src[i] && op->src[i]->type != GGML_TYPE_F32) {
+                if (op->src[i] && !is_supported_compute_type(op->src[i]->type)) {
                     return false;
                 }
             }

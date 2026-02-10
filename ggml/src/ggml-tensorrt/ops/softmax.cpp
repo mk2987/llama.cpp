@@ -39,6 +39,11 @@ nvinfer1::ITensor* handle_soft_max(NetworkBuilder* builder, const ggml_tensor* n
     }
 
     auto* network = builder->get_network();
+
+    // Save original type and upcast to FP32 for numerical stability
+    nvinfer1::DataType input_type = trt_src->getType();
+    trt_src = builder->maybe_cast(trt_src, nvinfer1::DataType::kFLOAT);
+
     nvinfer1::Dims dims = trt_src->getDimensions();
     nvinfer1::ITensor* input = trt_src;
 
@@ -81,6 +86,9 @@ nvinfer1::ITensor* handle_soft_max(NetworkBuilder* builder, const ggml_tensor* n
     softmax_layer->setName(layer_name.c_str());
 
     nvinfer1::ITensor* output = softmax_layer->getOutput(0);
+
+    // Cast back to original type if needed
+    output = builder->maybe_cast(output, input_type);
 
     GGML_LOG_DEBUG("%s: softmax on axes=0x%x, scale=%.4f, output shape %s\n",
         __func__, softmax_axes, scale,

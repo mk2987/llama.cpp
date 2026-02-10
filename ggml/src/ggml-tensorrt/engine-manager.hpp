@@ -12,14 +12,7 @@ namespace ggml_tensorrt {
 // Configuration for engine building
 struct EngineConfig {
     size_t max_workspace_size = 1ULL << 30; // 1 GB default
-    nvinfer1::BuilderFlag flags = static_cast<nvinfer1::BuilderFlag>(0);
-    bool use_fp16 = true;
-    bool use_bf16 = false;
-    bool use_int8 = false;
     int32_t dla_core = -1; // -1 means no DLA
-
-    // Optimization profile for dynamic shapes
-    bool use_dynamic_shapes = false;
 
     EngineConfig() = default;
 };

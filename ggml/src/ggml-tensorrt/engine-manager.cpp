@@ -221,26 +221,9 @@ void EngineManager::configure_builder(
         config.max_workspace_size
     );
 
-    // Set precision flags
-    // Note: kFP16 and kBF16 flags are deprecated in TensorRT 10+
-    // but still functional. Will be updated to use strongly-typed flags in future.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    if (config.use_fp16) {
-        builder_config->setFlag(nvinfer1::BuilderFlag::kFP16);
-        GGML_LOG_DEBUG("%s: enabled FP16 mode\n", __func__);
-    }
-
-    if (config.use_bf16) {
-        builder_config->setFlag(nvinfer1::BuilderFlag::kBF16);
-        GGML_LOG_DEBUG("%s: enabled BF16 mode\n", __func__);
-    }
-#pragma GCC diagnostic pop
-
-    if (config.use_int8) {
-        builder_config->setFlag(nvinfer1::BuilderFlag::kINT8);
-        GGML_LOG_DEBUG("%s: enabled INT8 mode\n", __func__);
-    }
+    // TRT-RTX uses strongly-typed mode by default — precision is determined
+    // by input tensor types, not global builder flags. kFP16/kBF16/kINT8
+    // builder flags are deprecated no-ops.
 
     // Set DLA core if specified
     if (config.dla_core >= 0) {
