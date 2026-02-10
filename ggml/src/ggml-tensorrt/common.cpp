@@ -34,9 +34,28 @@ void Logger::set_min_severity(Severity severity) {
     min_severity_ = severity;
 }
 
+Logger & get_global_logger() {
+    // Determine log level from environment variable (read once)
+    static Logger instance = []() {
+        nvinfer1::ILogger::Severity log_level = nvinfer1::ILogger::Severity::kWARNING;
+        const char* env = getenv("GGML_TENSORRT_LOG_LEVEL");
+        if (env) {
+            if (strcmp(env, "VERBOSE") == 0 || strcmp(env, "DEBUG") == 0) {
+                log_level = nvinfer1::ILogger::Severity::kVERBOSE;
+            } else if (strcmp(env, "INFO") == 0) {
+                log_level = nvinfer1::ILogger::Severity::kINFO;
+            } else if (strcmp(env, "ERROR") == 0) {
+                log_level = nvinfer1::ILogger::Severity::kERROR;
+            }
+        }
+        return Logger(log_level);
+    }();
+    return instance;
+}
+
 // Backend context implementation
 ggml_backend_tensorrt_context::ggml_backend_tensorrt_context(int device_id)
-    : device(device_id), stream(nullptr) {
+    : device(device_id), stream(nullptr), logger(nullptr) {
 
     // Set CUDA device
     CUDA_CHECK(cudaSetDevice(device));
@@ -44,29 +63,8 @@ ggml_backend_tensorrt_context::ggml_backend_tensorrt_context(int device_id)
     // Create CUDA stream
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-    // Determine log level from environment variable
-    nvinfer1::ILogger::Severity log_level = nvinfer1::ILogger::Severity::kWARNING;
-    const char* env_log_level = getenv("GGML_TENSORRT_LOG_LEVEL");
-    if (env_log_level) {
-        if (strcmp(env_log_level, "VERBOSE") == 0 || strcmp(env_log_level, "DEBUG") == 0) {
-            log_level = nvinfer1::ILogger::Severity::kVERBOSE;
-            GGML_LOG_INFO("%s: TensorRT log level set to VERBOSE\n", __func__);
-        } else if (strcmp(env_log_level, "INFO") == 0) {
-            log_level = nvinfer1::ILogger::Severity::kINFO;
-            GGML_LOG_INFO("%s: TensorRT log level set to INFO\n", __func__);
-        } else if (strcmp(env_log_level, "WARNING") == 0 || strcmp(env_log_level, "WARN") == 0) {
-            log_level = nvinfer1::ILogger::Severity::kWARNING;
-        } else if (strcmp(env_log_level, "ERROR") == 0) {
-            log_level = nvinfer1::ILogger::Severity::kERROR;
-            GGML_LOG_INFO("%s: TensorRT log level set to ERROR\n", __func__);
-        } else {
-            GGML_LOG_WARN("%s: unknown GGML_TENSORRT_LOG_LEVEL value '%s', using WARNING\n",
-                         __func__, env_log_level);
-        }
-    }
-
-    // Create logger
-    logger = std::make_unique<Logger>(log_level);
+    // Use the process-wide singleton logger (avoids TRT "logger differs" warning)
+    logger = &get_global_logger();
 
     // Create TensorRT runtime
     runtime = std::unique_ptr<nvinfer1::IRuntime>(
@@ -78,7 +76,7 @@ ggml_backend_tensorrt_context::ggml_backend_tensorrt_context(int device_id)
     }
 
     // Create engine manager
-    engine_mgr = std::make_unique<EngineManager>(runtime.get(), logger.get());
+    engine_mgr = std::make_unique<EngineManager>(runtime.get(), logger);
 
     GGML_LOG_INFO("%s: initialized TensorRT-RTX backend on device %d\n", __func__, device);
 }
@@ -87,7 +85,7 @@ ggml_backend_tensorrt_context::~ggml_backend_tensorrt_context() {
     // Reset in dependency order: engine_mgr uses runtime, runtime uses logger
     engine_mgr.reset();
     runtime.reset();
-    logger.reset();
+    // logger is a non-owning pointer to the global singleton — do not delete
 
     if (stream) {
         cudaStreamDestroy(stream);

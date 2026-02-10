@@ -34,13 +34,19 @@ private:
     Severity min_severity_;
 };
 
+// Return the global singleton Logger instance.
+// TensorRT internally registers a single global logger; using one shared
+// instance avoids the "logger differs" warning when multiple backends are
+// created in the same process.
+Logger & get_global_logger();
+
 // Backend context structure
 struct ggml_backend_tensorrt_context {
     int device;
     cudaStream_t stream;
 
     std::unique_ptr<nvinfer1::IRuntime> runtime;
-    std::unique_ptr<Logger> logger;
+    Logger * logger;  // non-owning, points to global singleton
     std::unique_ptr<EngineManager> engine_mgr;
 
     ggml_backend_tensorrt_context(int device);

@@ -419,7 +419,7 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             return GGML_STATUS_FAILED;
         }
 
-        NetworkBuilder net_builder(network.get(), ctx->logger.get());
+        NetworkBuilder net_builder(network.get(), ctx->logger);
 
         // Add leaf tensors as inputs with positional names
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
