@@ -99,9 +99,12 @@ nvinfer1::ITensor* handle_unary(NetworkBuilder* builder, const ggml_tensor* node
 
             // x / sqrt(2)
             float inv_sqrt2 = 1.0f / sqrtf(2.0f);
+            nvinfer1::Dims src_dims = trt_src->getDimensions();
             nvinfer1::Dims scalar_dims;
-            scalar_dims.nbDims = 1;
-            scalar_dims.d[0] = 1;
+            scalar_dims.nbDims = src_dims.nbDims;
+            for (int i = 0; i < src_dims.nbDims; i++) {
+                scalar_dims.d[i] = 1;
+            }
 
             nvinfer1::ITensor* scale_tensor = builder->create_constant_tensor(
                 &inv_sqrt2, scalar_dims, nvinfer1::DataType::kFLOAT);

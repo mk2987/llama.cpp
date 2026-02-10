@@ -44,9 +44,12 @@ nvinfer1::ITensor* handle_soft_max(NetworkBuilder* builder, const ggml_tensor* n
 
     // Apply scale if not 1.0
     if (scale != 1.0f) {
+        // Scalar must have same number of dims as input for TRT broadcasting
         nvinfer1::Dims scalar_dims;
-        scalar_dims.nbDims = 1;
-        scalar_dims.d[0] = 1;
+        scalar_dims.nbDims = dims.nbDims;
+        for (int i = 0; i < dims.nbDims; i++) {
+            scalar_dims.d[i] = 1;
+        }
 
         nvinfer1::ITensor* scale_tensor = builder->create_constant_tensor(
             &scale, scalar_dims, nvinfer1::DataType::kFLOAT);
