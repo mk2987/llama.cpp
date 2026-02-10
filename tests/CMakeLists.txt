@@ -231,13 +231,15 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
-# TensorRT backend tests (Milestones 1-2)
+# TensorRT backend tests
 if (GGML_TENSORRT)
     llama_build_and_test(test-tensorrt-init.cpp       LABEL "tensorrt")
     llama_build_and_test(test-tensorrt-devices.cpp    LABEL "tensorrt")
     llama_build_and_test(test-tensorrt-buffers.cpp    LABEL "tensorrt")
     llama_build_and_test(test-tensorrt-transfer.cpp   LABEL "tensorrt")
-    llama_build_and_test(test-tensorrt-operations.cpp LABEL "tensorrt")
+    llama_build_and_test(test-tensorrt-ops-m2.cpp     LABEL "tensorrt")
+    llama_build_and_test(test-tensorrt-ops-m3.cpp     LABEL "tensorrt")
+    llama_build_and_test(test-tensorrt-ops-m5.cpp     LABEL "tensorrt")
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
