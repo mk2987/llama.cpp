@@ -78,9 +78,16 @@ nvinfer1::Dims broadcast_dims(const nvinfer1::Dims& a, const nvinfer1::Dims& b) 
     nvinfer1::Dims result;
     result.nbDims = std::max(a.nbDims, b.nbDims);
 
+    // Right-align dimensions (NumPy/TRT broadcast rules):
+    // [n_tokens, 1536] vs [1536] aligns as:
+    //   [n_tokens, 1536]
+    //   [       1, 1536]  ← padded with leading 1
     for (int i = 0; i < result.nbDims; ++i) {
-        int64_t dim_a = (i < a.nbDims) ? a.d[i] : 1;
-        int64_t dim_b = (i < b.nbDims) ? b.d[i] : 1;
+        int idx_a = i - (result.nbDims - a.nbDims);
+        int idx_b = i - (result.nbDims - b.nbDims);
+
+        int64_t dim_a = (idx_a >= 0) ? a.d[idx_a] : 1;
+        int64_t dim_b = (idx_b >= 0) ? b.d[idx_b] : 1;
 
         GGML_ASSERT(dim_a == dim_b || dim_a == 1 || dim_b == 1);
         result.d[i] = std::max(dim_a, dim_b);

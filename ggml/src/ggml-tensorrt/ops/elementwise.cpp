@@ -5,40 +5,37 @@
 #include "ggml-impl.h"
 
 #include <NvInfer.h>
-#include <cstring>
 
 namespace ggml_tensorrt {
 
-// Helper function to add broadcasting if needed
-static nvinfer1::ITensor* ensure_broadcastable(
+// Pad a tensor with leading 1-dims so it has target_ndims dimensions.
+// E.g. [1536] with target_ndims=2 becomes [1, 1536].
+// This lets TRT's addElementWise handle broadcasting natively.
+static nvinfer1::ITensor* pad_to_ndims(
     nvinfer1::INetworkDefinition* network,
     nvinfer1::ITensor* tensor,
-    const nvinfer1::Dims& target_dims
+    int target_ndims
 ) {
-    nvinfer1::Dims current_dims = tensor->getDimensions();
-
-    // If dimensions match, no broadcasting needed
-    if (current_dims.nbDims == target_dims.nbDims) {
-        bool dims_match = true;
-        for (int i = 0; i < current_dims.nbDims; ++i) {
-            if (current_dims.d[i] != target_dims.d[i] && current_dims.d[i] != 1) {
-                dims_match = false;
-                break;
-            }
-        }
-        if (dims_match) {
-            return tensor;
-        }
+    nvinfer1::Dims current = tensor->getDimensions();
+    if (current.nbDims >= target_ndims) {
+        return tensor;
     }
 
-    // Need to reshape/broadcast
-    // Use IShuffleLayer to reshape
+    nvinfer1::Dims new_dims;
+    new_dims.nbDims = target_ndims;
+    int pad = target_ndims - current.nbDims;
+    for (int i = 0; i < pad; i++) {
+        new_dims.d[i] = 1;
+    }
+    for (int i = 0; i < current.nbDims; i++) {
+        new_dims.d[pad + i] = current.d[i];
+    }
+
     auto* shuffle = network->addShuffle(*tensor);
     if (shuffle == nullptr) {
         return nullptr;
     }
-
-    shuffle->setReshapeDimensions(target_dims);
+    shuffle->setReshapeDimensions(new_dims);
     return shuffle->getOutput(0);
 }
 
@@ -79,19 +76,17 @@ static nvinfer1::ITensor* handle_elementwise_binary(
         dims_to_string(dims0).c_str(),
         dims_to_string(dims1).c_str());
 
-    // Check if broadcasting is needed
-    if (dims0.nbDims != dims1.nbDims ||
-        memcmp(dims0.d, dims1.d, dims0.nbDims * sizeof(dims0.d[0])) != 0) {
-
-        // Compute broadcast dimensions
-        nvinfer1::Dims broadcast_result = broadcast_dims(dims0, dims1);
-
-        // Ensure both tensors are broadcastable to the result shape
-        trt_src0 = ensure_broadcastable(network, trt_src0, broadcast_result);
-        trt_src1 = ensure_broadcastable(network, trt_src1, broadcast_result);
+    // Equalize ranks by padding the lower-rank tensor with leading 1-dims.
+    // TRT's addElementWise handles broadcasting natively (dims of 1 expand
+    // to match the other operand), but requires both operands to have the
+    // same number of dimensions.
+    if (dims0.nbDims != dims1.nbDims) {
+        int max_ndims = std::max(dims0.nbDims, dims1.nbDims);
+        trt_src0 = pad_to_ndims(network, trt_src0, max_ndims);
+        trt_src1 = pad_to_ndims(network, trt_src1, max_ndims);
 
         if (trt_src0 == nullptr || trt_src1 == nullptr) {
-            GGML_LOG_ERROR("%s: failed to broadcast tensors for %s\n", __func__, op_name);
+            GGML_LOG_ERROR("%s: failed to pad tensors for %s\n", __func__, op_name);
             return nullptr;
         }
     }
