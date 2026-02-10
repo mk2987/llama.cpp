@@ -1,6 +1,7 @@
 #include "common.hpp"
 #include "network-builder.hpp"
 #include "engine-manager.hpp"
+#include "utils/type-utils.hpp"
 #include "ggml-tensorrt.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -448,6 +449,12 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
             // Only mark compute ops as outputs
             if (!is_shape_op(node->op)) {
+                // Cast TRT output to match GGML's expected output type.
+                // E.g. ggml_mul_mat always produces F32 but TRT with BF16
+                // inputs produces BF16 output in strongly-typed mode.
+                nvinfer1::DataType expected_type = ggml_type_to_tensorrt(node->type);
+                output = net_builder.maybe_cast(output, expected_type);
+
                 char out_name[64];
                 snprintf(out_name, sizeof(out_name), "output_%d", output_idx);
                 net_builder.mark_output(output, out_name);
