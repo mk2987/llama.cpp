@@ -73,23 +73,17 @@ EngineManager::~EngineManager() {
 }
 
 nvinfer1::ICudaEngine* EngineManager::build_engine(
+    nvinfer1::IBuilder* builder,
     nvinfer1::INetworkDefinition* network,
     const EngineConfig& config
 ) {
+    GGML_ASSERT(builder != nullptr);
     GGML_ASSERT(network != nullptr);
-
-    // Create builder
-    nvinfer1::IBuilder* builder = nvinfer1::createInferBuilder(*logger_);
-    if (builder == nullptr) {
-        GGML_LOG_ERROR("%s: failed to create TensorRT builder\n", __func__);
-        return nullptr;
-    }
 
     // Create builder config
     nvinfer1::IBuilderConfig* builder_config = builder->createBuilderConfig();
     if (builder_config == nullptr) {
         GGML_LOG_ERROR("%s: failed to create builder config\n", __func__);
-        delete builder;
         return nullptr;
     }
 
@@ -103,7 +97,6 @@ nvinfer1::ICudaEngine* EngineManager::build_engine(
     if (serialized_engine == nullptr) {
         GGML_LOG_ERROR("%s: failed to build serialized network\n", __func__);
         delete builder_config;
-        delete builder;
         return nullptr;
     }
 
@@ -113,10 +106,9 @@ nvinfer1::ICudaEngine* EngineManager::build_engine(
         serialized_engine->size()
     );
 
-    // Clean up
+    // Clean up serialization artifacts (engine is self-contained after deserialization)
     delete serialized_engine;
     delete builder_config;
-    delete builder;
 
     if (engine == nullptr) {
         GGML_LOG_ERROR("%s: failed to deserialize engine\n", __func__);

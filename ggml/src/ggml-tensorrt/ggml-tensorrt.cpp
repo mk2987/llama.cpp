@@ -459,7 +459,7 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         EngineConfig engine_config;
         engine_config.max_workspace_size = 1024ULL * 1024 * 1024;  // 1 GB
 
-        engine = ctx->engine_mgr->build_engine(network.get(), engine_config);
+        engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config);
         if (!engine) {
             GGML_LOG_ERROR("%s: failed to build TensorRT engine\n", __func__);
             return GGML_STATUS_FAILED;

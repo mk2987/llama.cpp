@@ -28,8 +28,10 @@ public:
     EngineManager(nvinfer1::IRuntime* runtime, nvinfer1::ILogger* logger);
     ~EngineManager();
 
-    // Build an engine from a network definition
+    // Build an engine from a network definition.
+    // The builder must be the same one that created the network.
     nvinfer1::ICudaEngine* build_engine(
+        nvinfer1::IBuilder* builder,
         nvinfer1::INetworkDefinition* network,
         const EngineConfig& config
     );
