@@ -38,6 +38,8 @@ set(GGML_SOURCES_TENSORRT
     ops/attention.cpp
     ops/unary.cpp
     ops/shape.cpp
+    ops/scale.cpp
+    ops/gather.cpp
     utils/tensor-utils.cpp
     utils/type-utils.cpp
     utils/logger.cpp

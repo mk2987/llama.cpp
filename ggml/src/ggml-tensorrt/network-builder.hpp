@@ -130,4 +130,10 @@ nvinfer1::ITensor* handle_unary(NetworkBuilder* builder, const ggml_tensor* node
 // Softmax
 nvinfer1::ITensor* handle_soft_max(NetworkBuilder* builder, const ggml_tensor* node);
 
+// Scale (multiply + optional bias)
+nvinfer1::ITensor* handle_scale(NetworkBuilder* builder, const ggml_tensor* node);
+
+// Gather rows (embedding lookup)
+nvinfer1::ITensor* handle_get_rows(NetworkBuilder* builder, const ggml_tensor* node);
+
 } // namespace ggml_tensorrt

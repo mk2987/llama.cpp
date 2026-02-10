@@ -697,6 +697,7 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_RMS_NORM:
         case GGML_OP_GROUP_NORM:
         case GGML_OP_SOFT_MAX:
+        case GGML_OP_SCALE:
         {
             // Output must be a supported compute type
             if (!is_supported_compute_type(op->type)) {
@@ -718,6 +719,22 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
                 if (max_bias != 0.0f) {
                     return false;
                 }
+            }
+            return true;
+        }
+        case GGML_OP_GET_ROWS:
+        {
+            // Output must be F32 (GET_ROWS always dequantizes)
+            if (op->type != GGML_TYPE_F32) {
+                return false;
+            }
+            // src[0] (data) must be F32/BF16/F16
+            if (!op->src[0] || !is_supported_compute_type(op->src[0]->type)) {
+                return false;
+            }
+            // src[1] (indices) must be I32
+            if (!op->src[1] || op->src[1]->type != GGML_TYPE_I32) {
+                return false;
             }
             return true;
         }
