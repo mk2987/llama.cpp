@@ -340,6 +340,16 @@ static void collect_leaves_recursive(
         collect_leaves_recursive(tensor->src[0], leaf_tensors, leaf_seen);
         return;
     }
+    // Trivial ops (CONT, CPY, DUP, SET_ROWS) are handled in Phase 1 via
+    // CUDA memcpy — they are NOT added to the TRT network.  Their output
+    // data is valid GPU memory, so treat them as leaf inputs.
+    if (tensor->op == GGML_OP_CONT || tensor->op == GGML_OP_CPY ||
+        tensor->op == GGML_OP_DUP  || tensor->op == GGML_OP_SET_ROWS) {
+        if (leaf_seen.insert(tensor).second) {
+            leaf_tensors.push_back(tensor);
+        }
+        return;
+    }
     // Intermediate compute op already in the TRT subgraph — skip
 }
 
