@@ -1,7 +1,31 @@
 // TensorRT backend tests — Milestone 5: BF16/FP16 Precision
 // BF16 add, mul_mat, rms_norm, softmax, transformer block; FP16 mul_mat
+//
+// NOTE: GGML operations determine output types independently of input types.
+// ggml_mul_mat always outputs F32. ggml_add inherits type from src[0].
+// Tests must read results using ggml_nbytes(output) and check output->type.
 
 #include "test-tensorrt-common.h"
+
+// Helper: read output tensor into FP32 vector, handling any output type
+static std::vector<float> read_output_as_fp32(struct ggml_tensor* t) {
+    int64_t n = ggml_nelements(t);
+    std::vector<float> result(n);
+
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, result.data(), 0, ggml_nbytes(t));
+    } else if (t->type == GGML_TYPE_BF16) {
+        std::vector<ggml_bf16_t> buf(n);
+        ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+        ggml_bf16_to_fp32_row(buf.data(), result.data(), n);
+    } else if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> buf(n);
+        ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+        ggml_fp16_to_fp32_row(buf.data(), result.data(), n);
+    }
+
+    return result;
+}
 
 static bool test_bf16_add() {
     printf("Testing BF16 ADD operation...\n");
@@ -41,22 +65,20 @@ static bool test_bf16_add() {
     ggml_backend_tensor_set(b, b_bf16.data(), 0, ggml_nbytes(b));
     ggml_backend_graph_compute(backend_trt, gf);
 
-    std::vector<ggml_bf16_t> c_bf16(n);
-    ggml_backend_tensor_get(c, c_bf16.data(), 0, ggml_nbytes(c));
-
-    std::vector<float> c_fp32(n);
-    ggml_bf16_to_fp32_row(c_bf16.data(), c_fp32.data(), n);
+    // ggml_add inherits type from src[0] (BF16), so output is BF16
+    std::vector<float> c_fp32 = read_output_as_fp32(c);
 
     for (int64_t i = 0; i < n; ++i) {
         float expected = a_fp32[i] + b_fp32[i];
-        if (fabs(c_fp32[i] - expected) > 1e-1f) {
-            fprintf(stderr, "BF16 ADD mismatch at %lld: got %.4f, expected %.4f\n",
-                    (long long)i, c_fp32[i], expected);
+        float tol = 0.01f * fabs(expected) + 0.05f;
+        if (fabs(c_fp32[i] - expected) > tol) {
+            fprintf(stderr, "BF16 ADD mismatch at %lld: got %.4f, expected %.4f (tol=%.4f)\n",
+                    (long long)i, c_fp32[i], expected, tol);
             return false;
         }
     }
 
-    printf("BF16 ADD test passed!\n");
+    printf("BF16 ADD test passed! (output type: %s)\n", ggml_type_name(c->type));
     ggml_backend_buffer_free(buffer_trt);
     ggml_backend_free(backend_trt);
     ggml_free(ctx);
@@ -99,11 +121,8 @@ static bool test_bf16_mul_mat() {
     ggml_backend_tensor_set(b, b_bf16.data(), 0, ggml_nbytes(b));
     ggml_backend_graph_compute(backend_trt, gf);
 
-    std::vector<ggml_bf16_t> c_bf16(M * N);
-    ggml_backend_tensor_get(c, c_bf16.data(), 0, ggml_nbytes(c));
-
-    std::vector<float> c_fp32(M * N);
-    ggml_bf16_to_fp32_row(c_bf16.data(), c_fp32.data(), M * N);
+    // ggml_mul_mat always outputs F32
+    std::vector<float> c_fp32 = read_output_as_fp32(c);
 
     float expected[6] = {20.0f, 60.0f, 30.0f, 14.0f, 58.0f, 52.0f};
     for (int i = 0; i < 6; i++) {
@@ -114,7 +133,7 @@ static bool test_bf16_mul_mat() {
         }
     }
 
-    printf("BF16 MUL_MAT test passed!\n");
+    printf("BF16 MUL_MAT test passed! (output type: %s)\n", ggml_type_name(c->type));
     ggml_backend_buffer_free(buffer_trt);
     ggml_backend_free(backend_trt);
     ggml_free(ctx);
@@ -155,18 +174,14 @@ static bool test_bf16_rms_norm() {
     ggml_backend_tensor_set(x, x_bf16.data(), 0, ggml_nbytes(x));
     ggml_backend_graph_compute(backend_trt, gf);
 
-    std::vector<ggml_bf16_t> y_bf16(n);
-    ggml_backend_tensor_get(y, y_bf16.data(), 0, ggml_nbytes(y));
-
-    std::vector<float> y_fp32(n);
-    ggml_bf16_to_fp32_row(y_bf16.data(), y_fp32.data(), n);
+    std::vector<float> y_fp32 = read_output_as_fp32(y);
 
     float sum_sq = 0.0f;
     for (int64_t i = 0; i < n; ++i) sum_sq += y_fp32[i] * y_fp32[i];
     float rms = sqrtf(sum_sq / n);
     ASSERT_TRUE(fabs(rms - 1.0f) < 0.2f);
 
-    printf("BF16 RMS_NORM test passed! (rms=%.4f)\n", rms);
+    printf("BF16 RMS_NORM test passed! (rms=%.4f, output type: %s)\n", rms, ggml_type_name(y->type));
     ggml_backend_buffer_free(buffer_trt);
     ggml_backend_free(backend_trt);
     ggml_free(ctx);
@@ -207,11 +222,7 @@ static bool test_bf16_softmax() {
     ggml_backend_tensor_set(x, x_bf16.data(), 0, ggml_nbytes(x));
     ggml_backend_graph_compute(backend_trt, gf);
 
-    std::vector<ggml_bf16_t> y_bf16(cols * rows);
-    ggml_backend_tensor_get(y, y_bf16.data(), 0, ggml_nbytes(y));
-
-    std::vector<float> y_fp32(cols * rows);
-    ggml_bf16_to_fp32_row(y_bf16.data(), y_fp32.data(), cols * rows);
+    std::vector<float> y_fp32 = read_output_as_fp32(y);
 
     for (int64_t r = 0; r < rows; ++r) {
         float row_sum = 0.0f;
@@ -226,7 +237,7 @@ static bool test_bf16_softmax() {
         }
     }
 
-    printf("BF16 SOFTMAX test passed!\n");
+    printf("BF16 SOFTMAX test passed! (output type: %s)\n", ggml_type_name(y->type));
     ggml_backend_buffer_free(buffer_trt);
     ggml_backend_free(backend_trt);
     ggml_free(ctx);
@@ -273,6 +284,8 @@ static bool test_bf16_transformer_block() {
     auto W_down_bf16 = fill_bf16(d_ff * d_model);
     auto b_out_bf16  = fill_bf16(d_model * n_batch);
 
+    // Graph: matmul→add→rms_norm→matmul→silu→matmul→add
+    // Note: ggml_mul_mat always outputs F32, so all downstream ops are F32
     struct ggml_cgraph* gf = ggml_new_graph(ctx);
     struct ggml_tensor* attn      = ggml_mul_mat(ctx, W_attn, x);
     struct ggml_tensor* attn_bias = ggml_add(ctx, attn, b_attn);
@@ -294,18 +307,14 @@ static bool test_bf16_transformer_block() {
     ggml_backend_tensor_set(b_out,  b_out_bf16.data(),  0, ggml_nbytes(b_out));
     ggml_backend_graph_compute(backend_trt, gf);
 
-    std::vector<ggml_bf16_t> y_bf16(d_model * n_batch);
-    ggml_backend_tensor_get(y, y_bf16.data(), 0, ggml_nbytes(y));
-
-    std::vector<float> y_fp32(d_model * n_batch);
-    ggml_bf16_to_fp32_row(y_bf16.data(), y_fp32.data(), d_model * n_batch);
+    std::vector<float> y_fp32 = read_output_as_fp32(y);
 
     for (int64_t i = 0; i < d_model * n_batch; ++i) {
         ASSERT_TRUE(!std::isnan(y_fp32[i]));
         ASSERT_TRUE(!std::isinf(y_fp32[i]));
     }
 
-    printf("BF16 transformer block test PASSED!\n");
+    printf("BF16 transformer block test PASSED! (output type: %s)\n", ggml_type_name(y->type));
     printf("  Sample output values: %.4f, %.4f, %.4f, %.4f\n",
            y_fp32[0], y_fp32[1], y_fp32[2], y_fp32[3]);
 
@@ -351,11 +360,8 @@ static bool test_fp16_mul_mat() {
     ggml_backend_tensor_set(b, b_fp16.data(), 0, ggml_nbytes(b));
     ggml_backend_graph_compute(backend_trt, gf);
 
-    std::vector<ggml_fp16_t> c_fp16(M * N);
-    ggml_backend_tensor_get(c, c_fp16.data(), 0, ggml_nbytes(c));
-
-    std::vector<float> c_fp32(M * N);
-    ggml_fp16_to_fp32_row(c_fp16.data(), c_fp32.data(), M * N);
+    // ggml_mul_mat always outputs F32
+    std::vector<float> c_fp32 = read_output_as_fp32(c);
 
     float expected[6] = {20.0f, 60.0f, 30.0f, 14.0f, 58.0f, 52.0f};
     for (int i = 0; i < 6; i++) {
@@ -366,7 +372,7 @@ static bool test_fp16_mul_mat() {
         }
     }
 
-    printf("FP16 MUL_MAT test passed!\n");
+    printf("FP16 MUL_MAT test passed! (output type: %s)\n", ggml_type_name(c->type));
     ggml_backend_buffer_free(buffer_trt);
     ggml_backend_free(backend_trt);
     ggml_free(ctx);
