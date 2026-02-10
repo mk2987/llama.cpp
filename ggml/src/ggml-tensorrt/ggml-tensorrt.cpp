@@ -318,18 +318,20 @@ static bool is_shape_op(ggml_op op) {
 
 // Recursively collect true leaf inputs, walking through shape op chains.
 // Shape ops (VIEW, RESHAPE, PERMUTE, TRANSPOSE) pass through to their src[0].
-// GGML_OP_NONE tensors are leaves. Other ops are intermediate compute results
-// already in the subgraph, so we skip them.
+// GGML_OP_NONE tensors are leaves.  Tensors produced by other TRT nodes in the
+// same subgraph are skipped.  Everything else (tensors from other backends,
+// trivial ops like CONT/CPY) is treated as a leaf with valid GPU data.
 static void collect_leaves_recursive(
     const ggml_tensor* tensor,
     std::vector<const ggml_tensor*>& leaf_tensors,
-    std::unordered_set<const ggml_tensor*>& leaf_seen
+    std::unordered_set<const ggml_tensor*>& leaf_seen,
+    const std::unordered_set<const ggml_tensor*>& trt_node_set
 ) {
     if (tensor == nullptr) {
         return;
     }
     if (tensor->op == GGML_OP_NONE) {
-        // True leaf input
+        // True leaf input (weight, embedding, etc.)
         if (leaf_seen.insert(tensor).second) {
             leaf_tensors.push_back(tensor);
         }
@@ -337,20 +339,21 @@ static void collect_leaves_recursive(
     }
     if (is_shape_op(tensor->op)) {
         // Walk through shape op to find real leaf
-        collect_leaves_recursive(tensor->src[0], leaf_tensors, leaf_seen);
+        collect_leaves_recursive(tensor->src[0], leaf_tensors, leaf_seen, trt_node_set);
         return;
     }
-    // Trivial ops (CONT, CPY, DUP, SET_ROWS) are handled in Phase 1 via
-    // CUDA memcpy — they are NOT added to the TRT network.  Their output
-    // data is valid GPU memory, so treat them as leaf inputs.
-    if (tensor->op == GGML_OP_CONT || tensor->op == GGML_OP_CPY ||
-        tensor->op == GGML_OP_DUP  || tensor->op == GGML_OP_SET_ROWS) {
-        if (leaf_seen.insert(tensor).second) {
-            leaf_tensors.push_back(tensor);
-        }
+    if (trt_node_set.count(tensor)) {
+        // Produced by another TRT node in our subgraph — skip
         return;
     }
-    // Intermediate compute op already in the TRT subgraph — skip
+    // Tensor produced outside our TRT subgraph (another backend, trivial op
+    // like CONT/CPY, etc.).  Its GPU data is valid, so treat as a leaf input.
+    if (leaf_seen.insert(tensor).second) {
+        leaf_tensors.push_back(tensor);
+        GGML_LOG_DEBUG("%s: external tensor op=%s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] added as leaf\n",
+            __func__, ggml_op_name(tensor->op), ggml_type_name(tensor->type),
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+    }
 }
 
 static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -358,12 +361,29 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
     CUDA_CHECK(cudaSetDevice(ctx->device));
 
-    // ── Phase 1: Handle trivial ops, collect TRT nodes and leaf inputs ──
+    // ── Phase 1a: Categorize nodes into trivial vs TRT ──
 
-    // TRT node indices within cgraph->nodes (includes shape ops and compute ops)
     std::vector<int> trt_node_indices;
+    std::unordered_set<const ggml_tensor*> trt_node_set;
 
-    // Leaf inputs in stable discovery order (deduped)
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        switch (node->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_CPY:
+            case GGML_OP_DUP:
+            case GGML_OP_CONT:
+            case GGML_OP_SET_ROWS:
+                break; // trivial — handled separately
+            default:
+                trt_node_indices.push_back(i);
+                trt_node_set.insert(node);
+                break;
+        }
+    }
+
+    // ── Phase 1b: Execute trivial ops and collect leaf inputs ──
+
     std::vector<const ggml_tensor*> leaf_tensors;
     std::unordered_set<const ggml_tensor*> leaf_seen;
 
@@ -371,7 +391,6 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         ggml_tensor * node = cgraph->nodes[i];
 
         switch (node->op) {
-            // NONE is a no-op, skip
             case GGML_OP_NONE:
                 continue;
 
@@ -389,27 +408,21 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             }
 
             // SET_ROWS — scatter F32 source rows into destination (KV cache)
-            // node      = view of destination (same data pointer as src[2])
-            // src[0]    = source rows (always F32)
-            // src[1]    = indices (I32 or I64)
-            // src[2]    = original destination tensor
             case GGML_OP_SET_ROWS:
             {
                 const ggml_tensor * src0 = node->src[0];  // source rows (F32)
                 const ggml_tensor * src1 = node->src[1];  // indices
 
-                const int64_t ne00 = src0->ne[0];  // row width
-                const int64_t ne01 = src0->ne[1];  // num rows per batch
-                const int64_t ne02 = src0->ne[2];  // batch dim 2
-                const int64_t ne03 = src0->ne[3];  // batch dim 3
+                const int64_t ne00 = src0->ne[0];
+                const int64_t ne01 = src0->ne[1];
+                const int64_t ne02 = src0->ne[2];
+                const int64_t ne03 = src0->ne[3];
 
                 const int64_t ne11 = src1->ne[1];
                 const int64_t ne12 = src1->ne[2];
 
-                // Synchronize stream before host-side index reads
                 CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
 
-                // Copy index tensor to host
                 const size_t idx_bytes = ggml_nbytes(src1);
                 std::vector<uint8_t> idx_host(idx_bytes);
 
@@ -419,7 +432,6 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
                     CUDA_CHECK(cudaMemcpy(idx_host.data(), src1->data, idx_bytes, cudaMemcpyDeviceToHost));
                 }
 
-                // Helper to read an index value from the host copy
                 const bool idx_i64 = (src1->type == GGML_TYPE_I64);
                 auto read_idx = [&](size_t byte_offset) -> int64_t {
                     if (idx_i64) {
@@ -437,7 +449,6 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
                 const size_t dst_row_bytes = ggml_row_size(node->type, ne00);
                 const bool need_convert = (node->type != GGML_TYPE_F32);
 
-                // Temp host buffers for type conversion (allocated once, reused)
                 std::vector<float>   host_f32;
                 std::vector<uint8_t> host_cvt;
                 if (need_convert) {
@@ -452,30 +463,25 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
                             const int64_t i11 = i02 % ne11;
                             const int64_t i10 = i01;
 
-                            // Index byte offset using src1 strides
                             const size_t idx_off = i10 * src1->nb[0]
                                                  + i11 * src1->nb[1]
                                                  + i12 * src1->nb[2];
                             const int64_t dst_row = read_idx(idx_off);
 
-                            // Source pointer (src0 strides)
                             const char * src_ptr = (const char *)src0->data
                                 + i01 * src0->nb[1]
                                 + i02 * src0->nb[2]
                                 + i03 * src0->nb[3];
 
-                            // Destination pointer (node strides)
                             char * dst_ptr = (char *)node->data
                                 + dst_row * node->nb[1]
                                 + i02     * node->nb[2]
                                 + i03     * node->nb[3];
 
                             if (!need_convert) {
-                                // F32 → F32: device-to-device copy
                                 CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, src_row_bytes,
                                                            cudaMemcpyDeviceToDevice, ctx->stream));
                             } else {
-                                // F32 → F16/BF16: copy to host, convert, copy back
                                 CUDA_CHECK(cudaMemcpy(host_f32.data(), src_ptr, src_row_bytes,
                                                       cudaMemcpyDeviceToHost));
 
@@ -502,13 +508,11 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
             default:
             {
-                // Shape ops and compute ops both go into TRT node list
-                trt_node_indices.push_back(i);
-
-                // Collect leaf inputs recursively (walks through shape ops)
+                // Collect leaf inputs for TRT nodes (uses trt_node_set to
+                // distinguish "produced by our subgraph" from "external")
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j]) {
-                        collect_leaves_recursive(node->src[j], leaf_tensors, leaf_seen);
+                        collect_leaves_recursive(node->src[j], leaf_tensors, leaf_seen, trt_node_set);
                     }
                 }
                 break;
