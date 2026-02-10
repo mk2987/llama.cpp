@@ -185,7 +185,26 @@ nvinfer1::IExecutionContext* EngineManager::get_or_create_context(uint64_t hash)
         return nullptr;
     }
 
-    nvinfer1::IExecutionContext* ctx = engine_it->second->createExecutionContext();
+    nvinfer1::IExecutionContext* ctx = nullptr;
+
+    // Try CUDA graph capture path if enabled
+    if (use_cuda_graphs_) {
+        nvinfer1::IRuntimeConfig* rt_config = engine_it->second->createRuntimeConfig();
+        if (rt_config) {
+            rt_config->setCudaGraphStrategy(nvinfer1::CudaGraphStrategy::kWHOLE_GRAPH_CAPTURE);
+            ctx = engine_it->second->createExecutionContext(rt_config);
+            delete rt_config;
+        }
+        if (!ctx) {
+            GGML_LOG_WARN("%s: CUDA graph context creation failed, falling back to regular context\n", __func__);
+        }
+    }
+
+    // Fallback: create context without CUDA graph capture
+    if (!ctx) {
+        ctx = engine_it->second->createExecutionContext();
+    }
+
     if (ctx == nullptr) {
         GGML_LOG_ERROR("%s: failed to create execution context\n", __func__);
         return nullptr;
@@ -229,8 +248,18 @@ void EngineManager::configure_builder(
         builder_config->setFlag(nvinfer1::BuilderFlag::kGPU_FALLBACK);
     }
 
+    // Set auxiliary streams for parallel layer execution
+    if (config.max_aux_streams > 0) {
+        builder_config->setMaxAuxStreams(config.max_aux_streams);
+        GGML_LOG_DEBUG("%s: max auxiliary streams: %d\n", __func__, config.max_aux_streams);
+    }
+
     GGML_LOG_DEBUG("%s: max workspace size: %zu bytes\n",
                   __func__, config.max_workspace_size);
+}
+
+void EngineManager::set_cuda_graphs(bool enabled) {
+    use_cuda_graphs_ = enabled;
 }
 
 } // namespace ggml_tensorrt

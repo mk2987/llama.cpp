@@ -13,6 +13,8 @@ namespace ggml_tensorrt {
 struct EngineConfig {
     size_t max_workspace_size = 1ULL << 30; // 1 GB default
     int32_t dla_core = -1; // -1 means no DLA
+    bool use_cuda_graphs = true;    // CUDA graph capture (on by default)
+    int32_t max_aux_streams = 0;    // 0 = TRT default, >0 = allow parallel streams
 
     EngineConfig() = default;
 };
@@ -57,7 +59,11 @@ public:
     // Returns a reusable context — caller must rebind tensor addresses before use.
     nvinfer1::IExecutionContext* get_or_create_context(uint64_t hash);
 
+    // Enable or disable CUDA graph capture for new execution contexts
+    void set_cuda_graphs(bool enabled);
+
 private:
+    bool use_cuda_graphs_ = true;
     nvinfer1::IRuntime* runtime_;
     nvinfer1::ILogger* logger_;
 

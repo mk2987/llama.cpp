@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <NvInfer.h>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -465,6 +466,11 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         // Build engine
         EngineConfig engine_config;
         engine_config.max_workspace_size = 1024ULL * 1024 * 1024;  // 1 GB
+
+        const char* aux_streams_env = getenv("GGML_TENSORRT_AUX_STREAMS");
+        if (aux_streams_env) {
+            engine_config.max_aux_streams = atoi(aux_streams_env);
+        }
 
         engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config);
         if (!engine) {

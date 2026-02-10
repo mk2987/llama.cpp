@@ -78,6 +78,18 @@ ggml_backend_tensorrt_context::ggml_backend_tensorrt_context(int device_id)
     // Create engine manager
     engine_mgr = std::make_unique<EngineManager>(runtime.get(), logger);
 
+    // CUDA graphs enabled by default, disable with GGML_TENSORRT_CUDA_GRAPHS=0
+    bool cuda_graphs = true;
+    const char* cuda_graphs_env = getenv("GGML_TENSORRT_CUDA_GRAPHS");
+    if (cuda_graphs_env && (strcmp(cuda_graphs_env, "0") == 0 || strcmp(cuda_graphs_env, "OFF") == 0)) {
+        cuda_graphs = false;
+        GGML_LOG_INFO("%s: CUDA graph capture disabled by env var\n", __func__);
+    }
+    engine_mgr->set_cuda_graphs(cuda_graphs);
+    if (cuda_graphs) {
+        GGML_LOG_INFO("%s: CUDA graph capture enabled\n", __func__);
+    }
+
     GGML_LOG_INFO("%s: initialized TensorRT-RTX backend on device %d\n", __func__, device);
 }
 
