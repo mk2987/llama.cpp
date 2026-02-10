@@ -35,6 +35,25 @@ nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* no
     // Get network
     auto* network = builder->get_network();
 
+    // TRT strongly-typed mode requires both matmul inputs to have the
+    // same type.  In real models the weights may be F16/BF16 while the
+    // activation (from a previous F32-output MUL_MAT) is F32.
+    // Cast the narrower type up to the wider one.
+    nvinfer1::DataType type0 = trt_src0->getType();
+    nvinfer1::DataType type1 = trt_src1->getType();
+    if (type0 != type1) {
+        // Promote to the wider type: F32 > BF16 > F16
+        nvinfer1::DataType common = nvinfer1::DataType::kFLOAT;
+        if (type0 != nvinfer1::DataType::kFLOAT && type1 != nvinfer1::DataType::kFLOAT) {
+            // Neither is F32 — pick BF16 if either is BF16, else stay with what we have
+            common = (type0 == nvinfer1::DataType::kBF16 || type1 == nvinfer1::DataType::kBF16)
+                   ? nvinfer1::DataType::kBF16
+                   : type0;
+        }
+        trt_src0 = builder->maybe_cast(trt_src0, common);
+        trt_src1 = builder->maybe_cast(trt_src1, common);
+    }
+
     // GGML MUL_MAT operation: C = A @ B
     // A has shape [K, N, ...] (K is the innermost dimension)
     // B has shape [K, M, ...] (Needs to be transposed by TensorRT)
