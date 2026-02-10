@@ -103,4 +103,16 @@ nvinfer1::ITensor* handle_div(NetworkBuilder* builder, const ggml_tensor* node);
 nvinfer1::ITensor* handle_rms_norm(NetworkBuilder* builder, const ggml_tensor* node);
 nvinfer1::ITensor* handle_group_norm(NetworkBuilder* builder, const ggml_tensor* node);
 
+// Shape operations
+nvinfer1::ITensor* handle_reshape(NetworkBuilder* builder, const ggml_tensor* node);
+nvinfer1::ITensor* handle_permute(NetworkBuilder* builder, const ggml_tensor* node);
+nvinfer1::ITensor* handle_transpose(NetworkBuilder* builder, const ggml_tensor* node);
+nvinfer1::ITensor* handle_view(NetworkBuilder* builder, const ggml_tensor* node);
+
+// Unary activation operations
+nvinfer1::ITensor* handle_unary(NetworkBuilder* builder, const ggml_tensor* node);
+
+// Softmax
+nvinfer1::ITensor* handle_soft_max(NetworkBuilder* builder, const ggml_tensor* node);
+
 } // namespace ggml_tensorrt

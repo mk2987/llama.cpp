@@ -308,14 +308,47 @@ static void ggml_backend_tensorrt_synchronize(ggml_backend_t backend) {
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
 }
 
+// Check if an op is a shape/metadata operation (zero-copy in GGML)
+static bool is_shape_op(ggml_op op) {
+    return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE ||
+           op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
+
+// Recursively collect true leaf inputs, walking through shape op chains.
+// Shape ops (VIEW, RESHAPE, PERMUTE, TRANSPOSE) pass through to their src[0].
+// GGML_OP_NONE tensors are leaves. Other ops are intermediate compute results
+// already in the subgraph, so we skip them.
+static void collect_leaves_recursive(
+    const ggml_tensor* tensor,
+    std::vector<const ggml_tensor*>& leaf_tensors,
+    std::unordered_set<const ggml_tensor*>& leaf_seen
+) {
+    if (tensor == nullptr) {
+        return;
+    }
+    if (tensor->op == GGML_OP_NONE) {
+        // True leaf input
+        if (leaf_seen.insert(tensor).second) {
+            leaf_tensors.push_back(tensor);
+        }
+        return;
+    }
+    if (is_shape_op(tensor->op)) {
+        // Walk through shape op to find real leaf
+        collect_leaves_recursive(tensor->src[0], leaf_tensors, leaf_seen);
+        return;
+    }
+    // Intermediate compute op already in the TRT subgraph — skip
+}
+
 static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_tensorrt_context * ctx = (ggml_backend_tensorrt_context *) backend->context;
 
     CUDA_CHECK(cudaSetDevice(ctx->device));
 
-    // ── Phase 1: Handle trivial ops, collect TRT compute nodes and leaf inputs ──
+    // ── Phase 1: Handle trivial ops, collect TRT nodes and leaf inputs ──
 
-    // TRT node indices within cgraph->nodes
+    // TRT node indices within cgraph->nodes (includes shape ops and compute ops)
     std::vector<int> trt_node_indices;
 
     // Leaf inputs in stable discovery order (deduped)
@@ -326,12 +359,8 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         ggml_tensor * node = cgraph->nodes[i];
 
         switch (node->op) {
-            // Metadata ops — skip (scheduler handles views/reshapes)
+            // NONE is a no-op, skip
             case GGML_OP_NONE:
-            case GGML_OP_VIEW:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
                 continue;
 
             // Copy ops — handle via CUDA memcpy directly
@@ -349,15 +378,13 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
             default:
             {
-                // This is a compute op for TensorRT
+                // Shape ops and compute ops both go into TRT node list
                 trt_node_indices.push_back(i);
 
-                // Collect leaf inputs (GGML_OP_NONE tensors) in discovery order
+                // Collect leaf inputs recursively (walks through shape ops)
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
-                    if (node->src[j] && node->src[j]->op == GGML_OP_NONE) {
-                        if (leaf_seen.insert(node->src[j]).second) {
-                            leaf_tensors.push_back(node->src[j]);
-                        }
+                    if (node->src[j]) {
+                        collect_leaves_recursive(node->src[j], leaf_tensors, leaf_seen);
                     }
                 }
                 break;
@@ -404,7 +431,10 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             }
         }
 
-        // Process TRT compute nodes
+        // Process all TRT nodes (shape ops + compute ops)
+        // Only mark compute ops (non-shape-ops) as network outputs.
+        // Shape ops share data pointers with their source in GGML,
+        // so binding them as outputs would create duplicate address bindings.
         int output_idx = 0;
         for (int idx : trt_node_indices) {
             ggml_tensor * node = cgraph->nodes[idx];
@@ -416,11 +446,13 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
                 return GGML_STATUS_FAILED;
             }
 
-            // Mark as output with positional name
-            char out_name[64];
-            snprintf(out_name, sizeof(out_name), "output_%d", output_idx);
-            net_builder.mark_output(output, out_name);
-            output_idx++;
+            // Only mark compute ops as outputs
+            if (!is_shape_op(node->op)) {
+                char out_name[64];
+                snprintf(out_name, sizeof(out_name), "output_%d", output_idx);
+                net_builder.mark_output(output, out_name);
+                output_idx++;
+            }
         }
 
         // Build engine
@@ -456,15 +488,20 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         }
     }
 
-    // Bind output addresses (positional names)
-    for (size_t k = 0; k < trt_node_indices.size(); k++) {
-        ggml_tensor * node = cgraph->nodes[trt_node_indices[k]];
+    // Bind output addresses — only for compute ops (skip shape ops)
+    int output_idx = 0;
+    for (int idx : trt_node_indices) {
+        ggml_tensor * node = cgraph->nodes[idx];
+        if (is_shape_op(node->op)) {
+            continue;
+        }
         char name[64];
-        snprintf(name, sizeof(name), "output_%zu", k);
+        snprintf(name, sizeof(name), "output_%d", output_idx);
         if (!exec_ctx->setTensorAddress(name, node->data)) {
             GGML_LOG_ERROR("%s: failed to set output tensor address for %s\n", __func__, name);
             return GGML_STATUS_FAILED;
         }
+        output_idx++;
     }
 
     // Execute
@@ -643,6 +680,7 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_DIV:
         case GGML_OP_RMS_NORM:
         case GGML_OP_GROUP_NORM:
+        case GGML_OP_SOFT_MAX:
         {
             // Output must be F32
             if (op->type != GGML_TYPE_F32) {
@@ -654,7 +692,45 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
                     return false;
                 }
             }
+            // SOFT_MAX: reject mask and ALiBi
+            if (op->op == GGML_OP_SOFT_MAX) {
+                if (op->src[1] != nullptr) {
+                    return false;
+                }
+                float max_bias = 0.0f;
+                memcpy(&max_bias, &op->op_params[1], sizeof(float));
+                if (max_bias != 0.0f) {
+                    return false;
+                }
+            }
             return true;
+        }
+        case GGML_OP_UNARY:
+        {
+            // Output must be F32
+            if (op->type != GGML_TYPE_F32) {
+                return false;
+            }
+            // All sources must be F32
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                if (op->src[i] && op->src[i]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+            }
+            // Only supported unary sub-ops
+            enum ggml_unary_op uop = ggml_get_unary_op(op);
+            switch (uop) {
+                case GGML_UNARY_OP_SILU:
+                case GGML_UNARY_OP_GELU:
+                case GGML_UNARY_OP_GELU_ERF:
+                case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_TANH:
+                case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_EXP:
+                    return true;
+                default:
+                    return false;
+            }
         }
         default:
             break;
