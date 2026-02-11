@@ -246,4 +246,34 @@ nvinfer1::ITensor* NetworkBuilder::maybe_cast(
     return cast->getOutput(0);
 }
 
+nvinfer1::ITensor* NetworkBuilder::pad_to_ndims(
+    nvinfer1::ITensor* tensor,
+    int target_ndims
+) {
+    GGML_ASSERT(tensor != nullptr);
+
+    nvinfer1::Dims current = tensor->getDimensions();
+    if (current.nbDims >= target_ndims) {
+        return tensor;
+    }
+
+    nvinfer1::Dims new_dims;
+    new_dims.nbDims = target_ndims;
+    int pad = target_ndims - current.nbDims;
+    for (int i = 0; i < pad; i++) {
+        new_dims.d[i] = 1;
+    }
+    for (int i = 0; i < current.nbDims; i++) {
+        new_dims.d[pad + i] = current.d[i];
+    }
+
+    auto* shuffle = network_->addShuffle(*tensor);
+    if (shuffle == nullptr) {
+        GGML_LOG_ERROR("%s: failed to add shuffle layer for rank padding\n", __func__);
+        return nullptr;
+    }
+    shuffle->setReshapeDimensions(new_dims);
+    return shuffle->getOutput(0);
+}
+
 } // namespace ggml_tensorrt

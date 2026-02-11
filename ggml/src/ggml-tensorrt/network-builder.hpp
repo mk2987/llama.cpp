@@ -86,6 +86,14 @@ public:
         nvinfer1::DataType target_type
     );
 
+    // Pad a tensor with leading 1-dims so it has target_ndims dimensions.
+    // E.g. [N, K] with target_ndims=3 becomes [1, N, K].
+    // Returns the tensor unchanged if it already has enough dimensions.
+    nvinfer1::ITensor* pad_to_ndims(
+        nvinfer1::ITensor* tensor,
+        int target_ndims
+    );
+
 private:
     nvinfer1::INetworkDefinition* network_;
     nvinfer1::ILogger* logger_;

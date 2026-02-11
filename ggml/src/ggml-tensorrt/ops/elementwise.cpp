@@ -8,37 +8,6 @@
 
 namespace ggml_tensorrt {
 
-// Pad a tensor with leading 1-dims so it has target_ndims dimensions.
-// E.g. [1536] with target_ndims=2 becomes [1, 1536].
-// This lets TRT's addElementWise handle broadcasting natively.
-static nvinfer1::ITensor* pad_to_ndims(
-    nvinfer1::INetworkDefinition* network,
-    nvinfer1::ITensor* tensor,
-    int target_ndims
-) {
-    nvinfer1::Dims current = tensor->getDimensions();
-    if (current.nbDims >= target_ndims) {
-        return tensor;
-    }
-
-    nvinfer1::Dims new_dims;
-    new_dims.nbDims = target_ndims;
-    int pad = target_ndims - current.nbDims;
-    for (int i = 0; i < pad; i++) {
-        new_dims.d[i] = 1;
-    }
-    for (int i = 0; i < current.nbDims; i++) {
-        new_dims.d[pad + i] = current.d[i];
-    }
-
-    auto* shuffle = network->addShuffle(*tensor);
-    if (shuffle == nullptr) {
-        return nullptr;
-    }
-    shuffle->setReshapeDimensions(new_dims);
-    return shuffle->getOutput(0);
-}
-
 // Generic handler for elementwise binary operations
 static nvinfer1::ITensor* handle_elementwise_binary(
     NetworkBuilder* builder,
@@ -65,8 +34,6 @@ static nvinfer1::ITensor* handle_elementwise_binary(
         return nullptr;
     }
 
-    auto* network = builder->get_network();
-
     // Get dimensions
     nvinfer1::Dims dims0 = trt_src0->getDimensions();
     nvinfer1::Dims dims1 = trt_src1->getDimensions();
@@ -82,8 +49,8 @@ static nvinfer1::ITensor* handle_elementwise_binary(
     // same number of dimensions.
     if (dims0.nbDims != dims1.nbDims) {
         int max_ndims = std::max(dims0.nbDims, dims1.nbDims);
-        trt_src0 = pad_to_ndims(network, trt_src0, max_ndims);
-        trt_src1 = pad_to_ndims(network, trt_src1, max_ndims);
+        trt_src0 = builder->pad_to_ndims(trt_src0, max_ndims);
+        trt_src1 = builder->pad_to_ndims(trt_src1, max_ndims);
 
         if (trt_src0 == nullptr || trt_src1 == nullptr) {
             GGML_LOG_ERROR("%s: failed to pad tensors for %s\n", __func__, op_name);
@@ -92,7 +59,7 @@ static nvinfer1::ITensor* handle_elementwise_binary(
     }
 
     // Add ElementWise layer
-    auto* layer = network->addElementWise(*trt_src0, *trt_src1, op);
+    auto* layer = builder->get_network()->addElementWise(*trt_src0, *trt_src1, op);
     if (layer == nullptr) {
         GGML_LOG_ERROR("%s: failed to create ElementWise layer for %s\n", __func__, op_name);
         return nullptr;

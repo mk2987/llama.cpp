@@ -75,6 +75,21 @@ nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* no
         dims_to_string(dims0).c_str(),
         dims_to_string(dims1).c_str());
 
+    // TRT-RTX requires both matmul inputs to have the same number of
+    // dimensions.  In real models, weights are typically 2D while
+    // activations carry a batch dimension (3D+).  Pad the lower-rank
+    // tensor with leading 1-dims to match.
+    if (dims0.nbDims != dims1.nbDims) {
+        int max_ndims = std::max(dims0.nbDims, dims1.nbDims);
+        trt_src0 = builder->pad_to_ndims(trt_src0, max_ndims);
+        trt_src1 = builder->pad_to_ndims(trt_src1, max_ndims);
+
+        if (trt_src0 == nullptr || trt_src1 == nullptr) {
+            GGML_LOG_ERROR("%s: failed to pad matmul inputs to matching rank\n", __func__);
+            return nullptr;
+        }
+    }
+
     // For basic 2D matrix multiplication:
     // GGML specification: A @ B^T (B is transposed internally)
     //
