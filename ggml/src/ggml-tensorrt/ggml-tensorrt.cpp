@@ -414,14 +414,6 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             case GGML_OP_NONE:
                 continue;
 
-            // Partial views are zero-copy aliases — data is already
-            // at the right offset.  Skip if not in the TRT subgraph.
-            case GGML_OP_VIEW:
-                if (!trt_node_set.count(node)) {
-                    continue;
-                }
-                break; // full view — fall through to default for leaf collection
-
             // Copy ops — handle via CUDA memcpy directly
             case GGML_OP_CPY:
             case GGML_OP_DUP:
