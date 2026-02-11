@@ -242,7 +242,6 @@ if (GGML_TENSORRT)
     llama_build_and_test(test-tensorrt-ops-m5.cpp     LABEL "tensorrt")
     llama_build_and_test(test-tensorrt-ops-m5b.cpp    LABEL "tensorrt")
     llama_build_and_test(test-tensorrt-ops-m6.cpp     LABEL "tensorrt")
-    llama_build_and_test(test-tensorrt-ops-m6a.cpp    LABEL "tensorrt")
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

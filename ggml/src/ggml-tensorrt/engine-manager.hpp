@@ -68,6 +68,11 @@ public:
     // Enable or disable CUDA graph capture for new execution contexts
     void set_cuda_graphs(bool enabled);
 
+    // Cache statistics (for profiling instrumentation)
+    int64_t cache_hits   = 0;
+    int64_t cache_misses = 0;
+    double  total_build_time_ms = 0.0;
+
 private:
     bool use_cuda_graphs_ = true;
     nvinfer1::IRuntime* runtime_;

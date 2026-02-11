@@ -2,6 +2,8 @@
 // Tests verify CUDA graph mode doesn't break correctness.
 // CUDA graphs are enabled by default, so these tests exercise the graph path
 // automatically without needing to set env vars.
+// These tests also serve as regression tests for execution context reuse
+// with address rebinding across repeated graph_compute calls.
 
 #include "test-tensorrt-common.h"
 

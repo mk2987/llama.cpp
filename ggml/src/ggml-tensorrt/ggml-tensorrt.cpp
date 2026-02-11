@@ -9,11 +9,13 @@
 #include <cuda_runtime.h>
 #include <NvInfer.h>
 #include <cassert>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -320,8 +322,8 @@ static bool is_shape_op(ggml_op op) {
 // Recursively collect true leaf inputs, walking through shape op chains.
 // Shape ops (VIEW, RESHAPE, PERMUTE, TRANSPOSE) pass through to their src[0].
 // GGML_OP_NONE tensors are leaves.  Tensors produced by other TRT nodes in the
-// same subgraph are skipped.  Everything else (tensors from other backends,
-// trivial ops like CONT/CPY) is treated as a leaf with valid GPU data.
+// same subgraph are skipped.  Everything else (tensors from other backends)
+// is treated as a leaf with valid GPU data.
 static void collect_leaves_recursive(
     const ggml_tensor* tensor,
     std::vector<const ggml_tensor*>& leaf_tensors,
@@ -355,8 +357,8 @@ static void collect_leaves_recursive(
         // Produced by another TRT node in our subgraph — skip
         return;
     }
-    // Tensor produced outside our TRT subgraph (another backend, trivial op
-    // like CONT/CPY, etc.).  Its GPU data is valid, so treat as a leaf input.
+    // Tensor produced outside our TRT subgraph (another backend).
+    // Its GPU data is valid, so treat as a leaf input.
     if (leaf_seen.insert(tensor).second) {
         leaf_tensors.push_back(tensor);
         GGML_LOG_DEBUG("%s: external tensor op=%s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] added as leaf\n",
@@ -365,10 +367,58 @@ static void collect_leaves_recursive(
     }
 }
 
+// Helper: read first N float values from GPU tensor for debug logging.
+// Handles F32/F16/BF16 by converting to F32.  Returns up to n_vals floats.
+static std::vector<float> debug_read_tensor_head(const ggml_tensor * tensor, cudaStream_t stream, int n_vals = 4) {
+    std::vector<float> result;
+    if (!tensor || !tensor->data) return result;
+
+    int64_t nelements = ggml_nelements(tensor);
+    int n = (int)std::min((int64_t)n_vals, nelements);
+    if (n <= 0) return result;
+
+    if (tensor->type == GGML_TYPE_F32) {
+        result.resize(n);
+        CUDA_CHECK(cudaMemcpyAsync(result.data(), tensor->data, n * sizeof(float),
+                                    cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> buf(n);
+        CUDA_CHECK(cudaMemcpyAsync(buf.data(), tensor->data, n * sizeof(ggml_fp16_t),
+                                    cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        result.resize(n);
+        ggml_fp16_to_fp32_row(buf.data(), result.data(), n);
+    } else if (tensor->type == GGML_TYPE_BF16) {
+        std::vector<ggml_bf16_t> buf(n);
+        CUDA_CHECK(cudaMemcpyAsync(buf.data(), tensor->data, n * sizeof(ggml_bf16_t),
+                                    cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        result.resize(n);
+        ggml_bf16_to_fp32_row(buf.data(), result.data(), n);
+    }
+    return result;
+}
+
 static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_tensorrt_context * ctx = (ggml_backend_tensorrt_context *) backend->context;
 
     CUDA_CHECK(cudaSetDevice(ctx->device));
+
+    // Instrumentation: env var checks (cached on first call)
+    static const bool debug_enabled  = (getenv("GGML_TENSORRT_DEBUG") != nullptr &&
+                                         atoi(getenv("GGML_TENSORRT_DEBUG")) != 0);
+    static const bool profile_enabled = (getenv("GGML_TENSORRT_PROFILE") != nullptr &&
+                                          atoi(getenv("GGML_TENSORRT_PROFILE")) != 0);
+
+    static int64_t call_counter = 0;
+    int64_t call_id = call_counter++;
+
+    // Address tracking for debug mode (detect address changes between calls)
+    static std::unordered_map<uint64_t, std::vector<void*>> prev_input_addrs;
+
+    auto profile_now = []() { return std::chrono::high_resolution_clock::now(); };
+    auto profile_start = profile_now();
 
     // ── Phase 1a: Categorize nodes into trivial vs TRT ──
 
@@ -379,11 +429,7 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         ggml_tensor * node = cgraph->nodes[i];
         switch (node->op) {
             case GGML_OP_NONE:
-            case GGML_OP_CPY:
-            case GGML_OP_DUP:
-            case GGML_OP_CONT:
-            case GGML_OP_SET_ROWS:
-                break; // trivial — handled separately
+                break; // no-op
             case GGML_OP_VIEW:
                 // Partial views (slices) extract a subset of elements and
                 // cannot be expressed as a TRT reshape.  Treat as boundary.
@@ -414,118 +460,6 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             case GGML_OP_NONE:
                 continue;
 
-            // Copy ops — handle via CUDA memcpy directly
-            case GGML_OP_CPY:
-            case GGML_OP_DUP:
-            case GGML_OP_CONT:
-            {
-                const size_t nb = ggml_nbytes(node);
-                if (node->src[0] && node->src[0]->data && node->data) {
-                    CUDA_CHECK(cudaMemcpyAsync(node->data, node->src[0]->data, nb,
-                                               cudaMemcpyDeviceToDevice, ctx->stream));
-                }
-                continue;
-            }
-
-            // SET_ROWS — scatter F32 source rows into destination (KV cache)
-            case GGML_OP_SET_ROWS:
-            {
-                const ggml_tensor * src0 = node->src[0];  // source rows (F32)
-                const ggml_tensor * src1 = node->src[1];  // indices
-
-                const int64_t ne00 = src0->ne[0];
-                const int64_t ne01 = src0->ne[1];
-                const int64_t ne02 = src0->ne[2];
-                const int64_t ne03 = src0->ne[3];
-
-                const int64_t ne11 = src1->ne[1];
-                const int64_t ne12 = src1->ne[2];
-
-                CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
-
-                const size_t idx_bytes = ggml_nbytes(src1);
-                std::vector<uint8_t> idx_host(idx_bytes);
-
-                if (src1->buffer && ggml_backend_buffer_is_host(src1->buffer)) {
-                    memcpy(idx_host.data(), src1->data, idx_bytes);
-                } else {
-                    CUDA_CHECK(cudaMemcpy(idx_host.data(), src1->data, idx_bytes, cudaMemcpyDeviceToHost));
-                }
-
-                const bool idx_i64 = (src1->type == GGML_TYPE_I64);
-                auto read_idx = [&](size_t byte_offset) -> int64_t {
-                    if (idx_i64) {
-                        int64_t v;
-                        memcpy(&v, idx_host.data() + byte_offset, sizeof(int64_t));
-                        return v;
-                    } else {
-                        int32_t v;
-                        memcpy(&v, idx_host.data() + byte_offset, sizeof(int32_t));
-                        return (int64_t)v;
-                    }
-                };
-
-                const size_t src_row_bytes = ne00 * sizeof(float);
-                const size_t dst_row_bytes = ggml_row_size(node->type, ne00);
-                const bool need_convert = (node->type != GGML_TYPE_F32);
-
-                std::vector<float>   host_f32;
-                std::vector<uint8_t> host_cvt;
-                if (need_convert) {
-                    host_f32.resize(ne00);
-                    host_cvt.resize(dst_row_bytes);
-                }
-
-                for (int64_t i03 = 0; i03 < ne03; ++i03) {
-                    for (int64_t i02 = 0; i02 < ne02; ++i02) {
-                        for (int64_t i01 = 0; i01 < ne01; ++i01) {
-                            const int64_t i12 = i03 % ne12;
-                            const int64_t i11 = i02 % ne11;
-                            const int64_t i10 = i01;
-
-                            const size_t idx_off = i10 * src1->nb[0]
-                                                 + i11 * src1->nb[1]
-                                                 + i12 * src1->nb[2];
-                            const int64_t dst_row = read_idx(idx_off);
-
-                            const char * src_ptr = (const char *)src0->data
-                                + i01 * src0->nb[1]
-                                + i02 * src0->nb[2]
-                                + i03 * src0->nb[3];
-
-                            char * dst_ptr = (char *)node->data
-                                + dst_row * node->nb[1]
-                                + i02     * node->nb[2]
-                                + i03     * node->nb[3];
-
-                            if (!need_convert) {
-                                CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, src_row_bytes,
-                                                           cudaMemcpyDeviceToDevice, ctx->stream));
-                            } else {
-                                CUDA_CHECK(cudaMemcpy(host_f32.data(), src_ptr, src_row_bytes,
-                                                      cudaMemcpyDeviceToHost));
-
-                                if (node->type == GGML_TYPE_F16) {
-                                    ggml_fp32_to_fp16_row(host_f32.data(),
-                                                          (ggml_fp16_t *)host_cvt.data(), ne00);
-                                } else if (node->type == GGML_TYPE_BF16) {
-                                    ggml_fp32_to_bf16_row(host_f32.data(),
-                                                          (ggml_bf16_t *)host_cvt.data(), ne00);
-                                } else {
-                                    GGML_LOG_ERROR("%s: SET_ROWS unsupported dst type %s\n",
-                                                   __func__, ggml_type_name(node->type));
-                                    return GGML_STATUS_FAILED;
-                                }
-
-                                CUDA_CHECK(cudaMemcpy(dst_ptr, host_cvt.data(), dst_row_bytes,
-                                                      cudaMemcpyHostToDevice));
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
             default:
             {
                 // Only collect leaf inputs for nodes in the TRT subgraph.
@@ -548,11 +482,16 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         return GGML_STATUS_SUCCESS;
     }
 
+    auto phase1_end = profile_now();
+
     // ── Phase 2: Engine cache lookup ──
 
     uint64_t hash = compute_graph_hash(cgraph, trt_node_indices);
 
     nvinfer1::ICudaEngine* engine = ctx->engine_mgr->get_cached_engine(hash);
+
+    auto phase2_end = profile_now();
+    bool was_cache_miss = (engine == nullptr);
 
     // ── Phase 3: Cache miss — build engine ──
 
@@ -697,6 +636,8 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         ctx->engine_mgr->cache_engine(hash, engine);
     }
 
+    auto phase3_end = profile_now();
+
     // ── Phase 4: Execute ──
 
     nvinfer1::IExecutionContext* exec_ctx = ctx->engine_mgr->get_or_create_context(hash);
@@ -716,25 +657,109 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
     }
 
     // Bind output addresses — only for compute ops (skip shape ops)
-    int output_idx = 0;
+    int n_outputs = 0;
     for (int idx : trt_node_indices) {
         ggml_tensor * node = cgraph->nodes[idx];
         if (is_shape_op(node->op)) {
             continue;
         }
         char name[64];
-        snprintf(name, sizeof(name), "output_%d", output_idx);
+        snprintf(name, sizeof(name), "output_%d", n_outputs);
         if (!exec_ctx->setTensorAddress(name, node->data)) {
             GGML_LOG_ERROR("%s: failed to set output tensor address for %s\n", __func__, name);
             return GGML_STATUS_FAILED;
         }
-        output_idx++;
+        n_outputs++;
+    }
+
+    // ── Debug: log input data before execution ──
+    if (debug_enabled) {
+        fprintf(stderr, "[TRT-DEBUG] call #%" PRId64 ", hash 0x%016" PRIx64 ", inputs: %zu, outputs: %d\n",
+            call_id, hash, leaf_tensors.size(), n_outputs);
+
+        for (size_t k = 0; k < leaf_tensors.size(); k++) {
+            const ggml_tensor * leaf = leaf_tensors[k];
+            auto vals = debug_read_tensor_head(leaf, ctx->stream);
+            fprintf(stderr, "[TRT-DEBUG]   input_%zu: addr=%p, type=%s, shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]",
+                k, leaf->data, ggml_type_name(leaf->type),
+                leaf->ne[0], leaf->ne[1], leaf->ne[2], leaf->ne[3]);
+            if (!vals.empty()) {
+                fprintf(stderr, ", first=[");
+                for (size_t v = 0; v < vals.size(); v++) {
+                    if (v > 0) fprintf(stderr, ", ");
+                    fprintf(stderr, "%.4g", vals[v]);
+                }
+                fprintf(stderr, "]");
+            }
+            fprintf(stderr, "\n");
+        }
+
+        // Address change detection
+        auto& prev_addrs = prev_input_addrs[hash];
+        std::vector<void*> cur_addrs(leaf_tensors.size());
+        for (size_t k = 0; k < leaf_tensors.size(); k++) {
+            cur_addrs[k] = leaf_tensors[k]->data;
+        }
+        if (!prev_addrs.empty() && prev_addrs.size() == cur_addrs.size()) {
+            for (size_t k = 0; k < cur_addrs.size(); k++) {
+                if (cur_addrs[k] != prev_addrs[k]) {
+                    fprintf(stderr, "[TRT-DEBUG]   input_%zu: address changed %p → %p\n",
+                        k, prev_addrs[k], cur_addrs[k]);
+                }
+            }
+        }
+        prev_addrs = cur_addrs;
     }
 
     // Execute
     if (!exec_ctx->enqueueV3(ctx->stream)) {
         GGML_LOG_ERROR("%s: failed to execute TensorRT engine\n", __func__);
         return GGML_STATUS_FAILED;
+    }
+
+    // ── Debug: log output data after execution ──
+    if (debug_enabled) {
+        CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+        int out_idx = 0;
+        for (int idx : trt_node_indices) {
+            ggml_tensor * node = cgraph->nodes[idx];
+            if (is_shape_op(node->op)) continue;
+            auto vals = debug_read_tensor_head(node, ctx->stream);
+            fprintf(stderr, "[TRT-DEBUG]   output_%d: addr=%p, type=%s, shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]",
+                out_idx, node->data, ggml_type_name(node->type),
+                node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+            if (!vals.empty()) {
+                fprintf(stderr, ", first=[");
+                for (size_t v = 0; v < vals.size(); v++) {
+                    if (v > 0) fprintf(stderr, ", ");
+                    fprintf(stderr, "%.4g", vals[v]);
+                }
+                fprintf(stderr, "]");
+            }
+            fprintf(stderr, "\n");
+            out_idx++;
+        }
+    }
+
+    auto phase4_end = profile_now();
+
+    // ── Profile: log phase timings ──
+    if (profile_enabled) {
+        auto to_ms = [](auto start, auto end) {
+            return std::chrono::duration<double, std::milli>(end - start).count();
+        };
+        fprintf(stderr, "[TRT-PROF] call #%" PRId64 ": hash=0x%016" PRIx64 ", nodes=%zu, leaves=%zu, "
+            "phase1=%.2fms, phase2=%.2fms, phase3=%.2fms (%s), phase4=%.2fms\n",
+            call_id, hash, trt_node_indices.size(), leaf_tensors.size(),
+            to_ms(profile_start, phase1_end),
+            to_ms(phase1_end, phase2_end),
+            to_ms(phase2_end, phase3_end),
+            was_cache_miss ? "miss" : "hit",
+            to_ms(phase3_end, phase4_end));
+
+        fprintf(stderr, "[TRT-PROF] cache: hits=%" PRId64 ", misses=%" PRId64 ", total_build_time=%.0fms\n",
+            ctx->engine_mgr->cache_hits, ctx->engine_mgr->cache_misses,
+            ctx->engine_mgr->total_build_time_ms);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -894,10 +919,6 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_RESHAPE:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-        case GGML_OP_CPY:
-        case GGML_OP_DUP:
-        case GGML_OP_CONT:
-        case GGML_OP_SET_ROWS:
             return true;
         default:
             break;

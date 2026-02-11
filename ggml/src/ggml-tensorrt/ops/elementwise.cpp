@@ -58,6 +58,36 @@ static nvinfer1::ITensor* handle_elementwise_binary(
         }
     }
 
+    // Reconcile types: TRT strongly-typed mode requires matching types for
+    // elementwise ops.  In real models, one operand may be F32 (from a
+    // preceding MUL_MAT cast) while the other is F16/BF16 (a weight).
+    // Cast to the NARROWER type to match matmul's strategy — the subgraph
+    // output cast at the boundary will convert back to the node's ggml type.
+    nvinfer1::DataType type0 = trt_src0->getType();
+    nvinfer1::DataType type1 = trt_src1->getType();
+    if (type0 != type1) {
+        nvinfer1::DataType common;
+        if (type0 == nvinfer1::DataType::kFLOAT && type1 == nvinfer1::DataType::kFLOAT) {
+            common = nvinfer1::DataType::kFLOAT;
+        } else if (type0 == nvinfer1::DataType::kBF16 || type1 == nvinfer1::DataType::kBF16) {
+            common = nvinfer1::DataType::kBF16;
+        } else {
+            common = nvinfer1::DataType::kHALF;
+        }
+
+        GGML_LOG_DEBUG("%s: %s type mismatch (src0=%d, src1=%d) → cast to %d\n",
+            __func__, op_name, (int)type0, (int)type1, (int)common);
+
+        trt_src0 = builder->maybe_cast(trt_src0, common);
+        trt_src1 = builder->maybe_cast(trt_src1, common);
+
+        if (trt_src0 == nullptr || trt_src1 == nullptr) {
+            GGML_LOG_ERROR("%s: type cast failed for %s (src0=%d, src1=%d, common=%d)\n",
+                __func__, op_name, (int)type0, (int)type1, (int)common);
+            return nullptr;
+        }
+    }
+
     // Add ElementWise layer
     auto* layer = builder->get_network()->addElementWise(*trt_src0, *trt_src1, op);
     if (layer == nullptr) {

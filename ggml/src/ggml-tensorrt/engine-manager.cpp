@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 
 #include <NvInferRuntime.h>
+#include <chrono>
 
 namespace ggml_tensorrt {
 
@@ -130,6 +131,8 @@ nvinfer1::ICudaEngine* EngineManager::build_engine(
     // Build serialized network
     GGML_LOG_INFO("%s: building TensorRT engine (this may take a while)...\n", __func__);
 
+    auto build_start = std::chrono::high_resolution_clock::now();
+
     nvinfer1::IHostMemory* serialized_engine = builder->buildSerializedNetwork(*network, *builder_config);
     if (serialized_engine == nullptr) {
         GGML_LOG_ERROR("%s: failed to build serialized network\n", __func__);
@@ -143,6 +146,10 @@ nvinfer1::ICudaEngine* EngineManager::build_engine(
         serialized_engine->size()
     );
 
+    auto build_end = std::chrono::high_resolution_clock::now();
+    double build_ms = std::chrono::duration<double, std::milli>(build_end - build_start).count();
+    total_build_time_ms += build_ms;
+
     // Clean up serialization artifacts (engine is self-contained after deserialization)
     delete serialized_engine;
     delete builder_config;
@@ -152,7 +159,7 @@ nvinfer1::ICudaEngine* EngineManager::build_engine(
         return nullptr;
     }
 
-    GGML_LOG_INFO("%s: successfully built TensorRT engine\n", __func__);
+    GGML_LOG_INFO("%s: successfully built TensorRT engine (%.1f ms)\n", __func__, build_ms);
 
     return engine;
 }
@@ -191,8 +198,10 @@ bool EngineManager::execute(
 nvinfer1::ICudaEngine* EngineManager::get_cached_engine(uint64_t hash) {
     auto it = engine_cache_.find(hash);
     if (it != engine_cache_.end()) {
+        cache_hits++;
         return it->second.get();
     }
+    cache_misses++;
     return nullptr;
 }
 
