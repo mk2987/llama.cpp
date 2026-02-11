@@ -37,13 +37,18 @@ void Logger::set_min_severity(Severity severity) {
 Logger & get_global_logger() {
     // Determine log level from environment variable (read once)
     static Logger instance = []() {
-        nvinfer1::ILogger::Severity log_level = nvinfer1::ILogger::Severity::kWARNING;
+        // Default to ERROR — TRT's WARN level is noisy (strongly-typed
+        // reminders, unused input warnings for dead branches, etc.).
+        // Use GGML_TENSORRT_LOG_LEVEL=WARN to see warnings.
+        nvinfer1::ILogger::Severity log_level = nvinfer1::ILogger::Severity::kERROR;
         const char* env = getenv("GGML_TENSORRT_LOG_LEVEL");
         if (env) {
             if (strcmp(env, "VERBOSE") == 0 || strcmp(env, "DEBUG") == 0) {
                 log_level = nvinfer1::ILogger::Severity::kVERBOSE;
             } else if (strcmp(env, "INFO") == 0) {
                 log_level = nvinfer1::ILogger::Severity::kINFO;
+            } else if (strcmp(env, "WARN") == 0 || strcmp(env, "WARNING") == 0) {
+                log_level = nvinfer1::ILogger::Severity::kWARNING;
             } else if (strcmp(env, "ERROR") == 0) {
                 log_level = nvinfer1::ILogger::Severity::kERROR;
             }

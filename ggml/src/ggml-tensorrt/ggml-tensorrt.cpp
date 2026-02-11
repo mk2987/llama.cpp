@@ -528,11 +528,14 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
             default:
             {
-                // Collect leaf inputs for TRT nodes (uses trt_node_set to
-                // distinguish "produced by our subgraph" from "external")
-                for (int j = 0; j < GGML_MAX_SRC; j++) {
-                    if (node->src[j]) {
-                        collect_leaves_recursive(node->src[j], leaf_tensors, leaf_seen, trt_node_set);
+                // Only collect leaf inputs for nodes in the TRT subgraph.
+                // Other nodes (e.g. partial VIEWs excluded from trt_node_set)
+                // would add their parents as unnecessary inputs.
+                if (trt_node_set.count(node)) {
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        if (node->src[j]) {
+                            collect_leaves_recursive(node->src[j], leaf_tensors, leaf_seen, trt_node_set);
+                        }
                     }
                 }
                 break;
