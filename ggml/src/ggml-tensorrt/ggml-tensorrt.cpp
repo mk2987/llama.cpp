@@ -550,7 +550,8 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
     // ── Phase 2: Engine cache lookup ──
 
-    uint64_t hash = compute_graph_hash(cgraph);
+    uint64_t hash = compute_graph_hash(cgraph, trt_node_indices);
+
     nvinfer1::ICudaEngine* engine = ctx->engine_mgr->get_cached_engine(hash);
 
     // ── Phase 3: Cache miss — build engine ──
@@ -659,11 +660,31 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
         // Build engine
         EngineConfig engine_config;
-        engine_config.max_workspace_size = 1024ULL * 1024 * 1024;  // 1 GB
+
+        // Workspace: use env var override, else cap at 256 MB or 25% of free VRAM
+        const char* workspace_env = getenv("GGML_TENSORRT_WORKSPACE_MB");
+        if (workspace_env) {
+            engine_config.max_workspace_size = (size_t)atoi(workspace_env) << 20;
+        } else {
+            size_t free_bytes = 0, total_bytes = 0;
+            cudaMemGetInfo(&free_bytes, &total_bytes);
+            size_t quarter_free = free_bytes / 4;
+            if (quarter_free < engine_config.max_workspace_size) {
+                engine_config.max_workspace_size = quarter_free;
+            }
+        }
 
         const char* aux_streams_env = getenv("GGML_TENSORRT_AUX_STREAMS");
         if (aux_streams_env) {
             engine_config.max_aux_streams = atoi(aux_streams_env);
+        }
+
+        {
+            size_t free_bytes = 0, total_bytes = 0;
+            cudaMemGetInfo(&free_bytes, &total_bytes);
+            GGML_LOG_WARN("%s: building engine (hash 0x%016" PRIx64 ", %zu nodes, workspace %zu MB, GPU free %zu MB / %zu MB)\n",
+                __func__, hash, trt_node_indices.size(),
+                engine_config.max_workspace_size >> 20, free_bytes >> 20, total_bytes >> 20);
         }
 
         engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config);

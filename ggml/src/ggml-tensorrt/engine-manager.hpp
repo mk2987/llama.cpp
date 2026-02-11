@@ -6,12 +6,13 @@
 #include <cstdint>
 #include <memory>
 #include <map>
+#include <vector>
 
 namespace ggml_tensorrt {
 
 // Configuration for engine building
 struct EngineConfig {
-    size_t max_workspace_size = 1ULL << 30; // 1 GB default
+    size_t max_workspace_size = 256ULL << 20; // 256 MB default
     int32_t dla_core = -1; // -1 means no DLA
     bool use_cuda_graphs = true;    // CUDA graph capture (on by default)
     int32_t max_aux_streams = 0;    // 0 = TRT default, >0 = allow parallel streams
@@ -23,6 +24,11 @@ struct EngineConfig {
 // Hashes op type, output type/shape, op_params, and source type/shapes.
 // Independent of pointer addresses — same structure yields same hash.
 uint64_t compute_graph_hash(const ggml_cgraph * cgraph);
+
+// Compute a structural hash over a subset of nodes identified by indices.
+// Only these nodes contribute to the hash — trivial ops (SET_ROWS, CPY, etc.)
+// whose parameters change every token are excluded.
+uint64_t compute_graph_hash(const ggml_cgraph * cgraph, const std::vector<int> & node_indices);
 
 // EngineManager handles building, caching, and executing TensorRT engines
 class EngineManager {

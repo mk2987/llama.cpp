@@ -60,6 +60,43 @@ uint64_t compute_graph_hash(const ggml_cgraph * cgraph) {
     return hash;
 }
 
+uint64_t compute_graph_hash(const ggml_cgraph * cgraph, const std::vector<int> & node_indices) {
+    uint64_t hash = FNV_OFFSET_BASIS;
+
+    for (int i : node_indices) {
+        GGML_ASSERT(i >= 0 && i < cgraph->n_nodes);
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        // Hash op type
+        hash = fnv1a_hash_value(hash, static_cast<int32_t>(node->op));
+
+        // Hash output data type
+        hash = fnv1a_hash_value(hash, static_cast<int32_t>(node->type));
+
+        // Hash output shape
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            hash = fnv1a_hash_value(hash, node->ne[d]);
+        }
+
+        // Hash op_params (all 16 int32 values)
+        hash = fnv1a_hash_bytes(hash, node->op_params, sizeof(node->op_params));
+
+        // Hash source tensor types and shapes (NOT pointers)
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                hash = fnv1a_hash_value(hash, static_cast<int32_t>(node->src[j]->type));
+                for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                    hash = fnv1a_hash_value(hash, node->src[j]->ne[d]);
+                }
+            } else {
+                hash = fnv1a_hash_value(hash, static_cast<int32_t>(-1));
+            }
+        }
+    }
+
+    return hash;
+}
+
 EngineManager::EngineManager(nvinfer1::IRuntime* runtime, nvinfer1::ILogger* logger)
     : runtime_(runtime), logger_(logger) {
     GGML_ASSERT(runtime_ != nullptr);
