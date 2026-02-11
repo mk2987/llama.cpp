@@ -339,8 +339,16 @@ static void collect_leaves_recursive(
         return;
     }
     if (is_shape_op(tensor->op)) {
-        // Walk through shape op to find real leaf
-        collect_leaves_recursive(tensor->src[0], leaf_tensors, leaf_seen, trt_node_set);
+        if (trt_node_set.count(tensor)) {
+            // Shape op is part of our TRT subgraph — walk through it
+            collect_leaves_recursive(tensor->src[0], leaf_tensors, leaf_seen, trt_node_set);
+        } else {
+            // Shape op NOT in our subgraph (e.g. partial view) — its
+            // data pointer is valid, so treat the tensor itself as a leaf.
+            if (leaf_seen.insert(tensor).second) {
+                leaf_tensors.push_back(tensor);
+            }
+        }
         return;
     }
     if (trt_node_set.count(tensor)) {
@@ -376,6 +384,17 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             case GGML_OP_CONT:
             case GGML_OP_SET_ROWS:
                 break; // trivial — handled separately
+            case GGML_OP_VIEW:
+                // Partial views (slices) extract a subset of elements and
+                // cannot be expressed as a TRT reshape.  Treat as boundary.
+                // Full views (same element count) are reshapes → TRT node.
+                if (node->src[0] &&
+                    ggml_nelements(node) != ggml_nelements(node->src[0])) {
+                    break; // partial view — subgraph boundary
+                }
+                trt_node_indices.push_back(i);
+                trt_node_set.insert(node);
+                break;
             default:
                 trt_node_indices.push_back(i);
                 trt_node_set.insert(node);
@@ -394,6 +413,14 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         switch (node->op) {
             case GGML_OP_NONE:
                 continue;
+
+            // Partial views are zero-copy aliases — data is already
+            // at the right offset.  Skip if not in the TRT subgraph.
+            case GGML_OP_VIEW:
+                if (!trt_node_set.count(node)) {
+                    continue;
+                }
+                break; // full view — fall through to default for leaf collection
 
             // Copy ops — handle via CUDA memcpy directly
             case GGML_OP_CPY:
