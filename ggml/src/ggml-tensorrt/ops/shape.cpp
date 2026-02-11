@@ -164,7 +164,9 @@ nvinfer1::ITensor* handle_transpose(NetworkBuilder* builder, const ggml_tensor* 
     return output;
 }
 
-// Handle VIEW: propagate source tensor (VIEW is just an alias)
+// Handle VIEW: reshape source tensor to match view output dimensions.
+// A VIEW in GGML reinterprets the data layout (e.g. splitting heads from
+// a flat projection).  In TRT this is a zero-copy reshape via IShuffleLayer.
 nvinfer1::ITensor* handle_view(NetworkBuilder* builder, const ggml_tensor* node) {
     GGML_ASSERT(builder != nullptr);
     GGML_ASSERT(node != nullptr);
@@ -179,9 +181,53 @@ nvinfer1::ITensor* handle_view(NetworkBuilder* builder, const ggml_tensor* node)
         return nullptr;
     }
 
-    GGML_LOG_DEBUG("%s: propagating view from src\n", __func__);
+    // Target dimensions from the VIEW output shape
+    nvinfer1::Dims target_dims = ggml_tensor_to_dims(node);
+    nvinfer1::Dims src_dims = trt_src->getDimensions();
 
-    return trt_src;
+    // If dims already match, just propagate
+    bool dims_match = (src_dims.nbDims == target_dims.nbDims);
+    if (dims_match) {
+        for (int i = 0; i < src_dims.nbDims; i++) {
+            if (src_dims.d[i] != target_dims.d[i]) {
+                dims_match = false;
+                break;
+            }
+        }
+    }
+    if (dims_match) {
+        return trt_src;
+    }
+
+    // Validate element count — partial views (slicing) cannot be handled
+    // as a TRT reshape.  In practice, partial views are followed by CONT
+    // which creates a TRT subgraph boundary.
+    if (!is_reshape_valid(src_dims, target_dims)) {
+        GGML_LOG_ERROR("%s: view element count mismatch: %s -> %s (partial view not supported in TRT)\n",
+            __func__, dims_to_string(src_dims).c_str(),
+            dims_to_string(target_dims).c_str());
+        return nullptr;
+    }
+
+    auto* network = builder->get_network();
+    auto* shuffle = network->addShuffle(*trt_src);
+    if (shuffle == nullptr) {
+        GGML_LOG_ERROR("%s: failed to create shuffle layer for view\n", __func__);
+        return nullptr;
+    }
+
+    shuffle->setReshapeDimensions(target_dims);
+
+    std::string layer_name = "view_" + std::to_string(reinterpret_cast<uintptr_t>(node));
+    shuffle->setName(layer_name.c_str());
+
+    nvinfer1::ITensor* output = shuffle->getOutput(0);
+
+    GGML_LOG_DEBUG("%s: view reshape %s -> %s\n",
+        __func__, dims_to_string(src_dims).c_str(),
+        dims_to_string(target_dims).c_str());
+
+    return output;
 }
 
 // Register shape operation handlers
