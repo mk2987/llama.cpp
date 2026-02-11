@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 
 #include <NvInfer.h>
+#include <algorithm>
 #include <cstring>
 
 namespace ggml_tensorrt {
@@ -75,7 +76,19 @@ nvinfer1::ITensor* handle_permute(NetworkBuilder* builder, const ggml_tensor* no
     const int32_t* axes = (const int32_t*)node->op_params;
     int ggml_axes[4] = { axes[0] & 0x3, axes[1] & 0x3, axes[2] & 0x3, axes[3] & 0x3 };
 
-    int n_dims = ggml_n_dims(src);
+    // Use max of source and output n_dims.  A permute like [0,2,1,3] on a
+    // 2D source (dims 2,3 are size 1) references axis 2, which is beyond
+    // ggml_n_dims(src)=2.  Using only the source n_dims produces negative
+    // TRT permutation indices → crash.  The output n_dims accounts for all
+    // non-trivial dimensions after the permutation.
+    int n_dims = std::max(ggml_n_dims(src), ggml_n_dims(node));
+
+    // Pad the TRT input tensor to n_dims if needed (adds leading 1-dims)
+    trt_src = builder->pad_to_ndims(trt_src, n_dims);
+    if (trt_src == nullptr) {
+        GGML_LOG_ERROR("%s: failed to pad input to %d dims\n", __func__, n_dims);
+        return nullptr;
+    }
 
     // Convert GGML permutation (innermost-first) to TRT permutation (outermost-first)
     // GGML dim i -> TRT dim (n_dims - 1 - i)
