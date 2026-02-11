@@ -562,41 +562,47 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
     if (engine == nullptr) {
         // ── Diagnostic dump: log the subgraph structure before building ──
-        GGML_LOG_INFO("%s: building TRT subgraph — hash 0x%016" PRIx64 ", %zu leaves, %zu nodes\n",
-            __func__, hash, leaf_tensors.size(), trt_node_indices.size());
+        // Controlled by GGML_TENSORRT_DUMP_GRAPH=1.  Uses fprintf(stderr)
+        // directly to bypass GGML's log callback which llama-cli filters.
+        static const bool dump_graph = (getenv("GGML_TENSORRT_DUMP_GRAPH") != nullptr &&
+                                        atoi(getenv("GGML_TENSORRT_DUMP_GRAPH")) != 0);
+        if (dump_graph) {
+            fprintf(stderr, "[TensorRT-RTX] building TRT subgraph — hash 0x%016" PRIx64 ", %zu leaves, %zu nodes\n",
+                hash, leaf_tensors.size(), trt_node_indices.size());
 
-        for (size_t k = 0; k < leaf_tensors.size(); k++) {
-            const ggml_tensor * leaf = leaf_tensors[k];
-            GGML_LOG_INFO("  input_%zu: op=%-12s type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] name=%s\n",
-                k, ggml_op_name(leaf->op), ggml_type_name(leaf->type),
-                leaf->ne[0], leaf->ne[1], leaf->ne[2], leaf->ne[3],
-                leaf->name);
-        }
-
-        for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
-            const ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
-            const char * op_str = ggml_op_name(node->op);
-
-            // For UNARY ops, append the sub-op name
-            char op_buf[64];
-            if (node->op == GGML_OP_UNARY) {
-                snprintf(op_buf, sizeof(op_buf), "UNARY(%s)",
-                    ggml_unary_op_name(ggml_get_unary_op(node)));
-                op_str = op_buf;
+            for (size_t k = 0; k < leaf_tensors.size(); k++) {
+                const ggml_tensor * leaf = leaf_tensors[k];
+                fprintf(stderr, "[TensorRT-RTX]   input_%zu: op=%-12s type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] name=%s\n",
+                    k, ggml_op_name(leaf->op), ggml_type_name(leaf->type),
+                    leaf->ne[0], leaf->ne[1], leaf->ne[2], leaf->ne[3],
+                    leaf->name);
             }
 
-            GGML_LOG_INFO("  node %3zu [%3d]: %-20s -> type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]%s\n",
-                ni, trt_node_indices[ni], op_str,
-                ggml_type_name(node->type),
-                node->ne[0], node->ne[1], node->ne[2], node->ne[3],
-                is_shape_op(node->op) ? " (shape)" : "");
+            for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+                const ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+                const char * op_str = ggml_op_name(node->op);
 
-            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
-                const ggml_tensor * src = node->src[s];
-                GGML_LOG_INFO("    src[%d]: op=%-12s type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] name=%s\n",
-                    s, ggml_op_name(src->op), ggml_type_name(src->type),
-                    src->ne[0], src->ne[1], src->ne[2], src->ne[3],
-                    src->name);
+                // For UNARY ops, append the sub-op name
+                char op_buf[64];
+                if (node->op == GGML_OP_UNARY) {
+                    snprintf(op_buf, sizeof(op_buf), "UNARY(%s)",
+                        ggml_unary_op_name(ggml_get_unary_op(node)));
+                    op_str = op_buf;
+                }
+
+                fprintf(stderr, "[TensorRT-RTX]   node %3zu [%3d]: %-20s -> type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]%s\n",
+                    ni, trt_node_indices[ni], op_str,
+                    ggml_type_name(node->type),
+                    node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                    is_shape_op(node->op) ? " (shape)" : "");
+
+                for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
+                    const ggml_tensor * src = node->src[s];
+                    fprintf(stderr, "[TensorRT-RTX]     src[%d]: op=%-12s type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] name=%s\n",
+                        s, ggml_op_name(src->op), ggml_type_name(src->type),
+                        src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                        src->name);
+                }
             }
         }
 
