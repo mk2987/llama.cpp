@@ -52,6 +52,12 @@ nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* no
         }
         trt_src0 = builder->maybe_cast(trt_src0, common);
         trt_src1 = builder->maybe_cast(trt_src1, common);
+
+        if (trt_src0 == nullptr || trt_src1 == nullptr) {
+            GGML_LOG_ERROR("%s: type cast failed (src0 type %d, src1 type %d, common %d)\n",
+                __func__, (int)type0, (int)type1, (int)common);
+            return nullptr;
+        }
     }
 
     // GGML MUL_MAT operation: C = A @ B
