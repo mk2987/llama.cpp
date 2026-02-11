@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <NvInfer.h>
 #include <cassert>
+#include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
