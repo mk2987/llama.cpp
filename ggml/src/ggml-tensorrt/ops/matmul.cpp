@@ -137,6 +137,16 @@ nvinfer1::ITensor* handle_mul_mat(NetworkBuilder* builder, const ggml_tensor* no
         return nullptr;
     }
 
+    // GGML MUL_MAT always produces F32 output regardless of input types.
+    // Cast the TRT output to match so downstream nodes in the same
+    // subgraph see the correct type (e.g. elementwise MUL with F32 norms).
+    nvinfer1::DataType expected_out = ggml_type_to_tensorrt(node->type);
+    output = builder->maybe_cast(output, expected_out);
+    if (output == nullptr) {
+        GGML_LOG_ERROR("%s: failed to cast matmul output to %d\n", __func__, (int)expected_out);
+        return nullptr;
+    }
+
     GGML_LOG_DEBUG("%s: created MatrixMultiply layer, output shape %s\n",
         __func__,
         dims_to_string(output->getDimensions()).c_str());
