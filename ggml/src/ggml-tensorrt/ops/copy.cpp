@@ -1,6 +1,8 @@
 #include "../common.hpp"
 #include "../network-builder.hpp"
 #include "../utils/tensor-utils.hpp"
+#include "../utils/type-utils.hpp"
+#include "ggml-impl.h"
 
 #include <NvInfer.h>
 
