@@ -19,6 +19,10 @@ endif()
 # Enable CUDA language for .cu kernel files
 enable_language(CUDA)
 
+if (NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89")
+endif()
+
 message(STATUS "TensorRT Backend: Building with TensorRT-RTX support")
 message(STATUS "  CUDA version: ${CUDAToolkit_VERSION}")
 message(STATUS "  TensorRT include: ${TENSORRT_INCLUDE_DIRS}")

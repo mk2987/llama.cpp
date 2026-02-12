@@ -13,6 +13,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cfloat>
 #include <limits>
 
 #define CUDA_SET_ROWS_BLOCK_SIZE 256
