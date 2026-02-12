@@ -314,17 +314,30 @@ static void ggml_backend_tensorrt_synchronize(ggml_backend_t backend) {
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
 }
 
-// Check if an op is a shape/metadata operation (zero-copy in GGML)
+// Check if an op is a shape/metadata operation (zero-copy in GGML).
+// These share data pointers with their source and must NOT be marked as
+// TRT engine outputs (that would create duplicate address bindings).
 static bool is_shape_op(ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE ||
            op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
 
+// Check if an op is a "walk-through" op for leaf collection.
+// These are TRT nodes whose source tensors should be recursively walked
+// to find true leaf inputs, similar to shape ops.
+// CPY/DUP: only src[0] is data; src[1] is dest template (shares output ptr).
+// CONT: only src[0] is data.
+static bool is_walkthrough_op(ggml_op op) {
+    return is_shape_op(op) || op == GGML_OP_CPY || op == GGML_OP_DUP || op == GGML_OP_CONT;
+}
+
 // Recursively collect true leaf inputs, walking through shape op chains.
 // Shape ops (VIEW, RESHAPE, PERMUTE, TRANSPOSE) pass through to their src[0].
 // GGML_OP_NONE tensors are leaves.  Tensors produced by other TRT nodes in the
-// same subgraph are skipped.  Everything else (tensors from other backends,
-// trivial ops like CONT/CPY) is treated as a leaf with valid GPU data.
+// same subgraph are skipped.  Walk-through ops (shape ops, CPY/DUP/CONT) that
+// are part of our TRT subgraph are traversed to find their true data sources.
+// Everything else (tensors from other backends, trivial ops like SET_ROWS)
+// is treated as a leaf with valid GPU data.
 static void collect_leaves_recursive(
     const ggml_tensor* tensor,
     std::vector<const ggml_tensor*>& leaf_tensors,
@@ -341,12 +354,14 @@ static void collect_leaves_recursive(
         }
         return;
     }
-    if (is_shape_op(tensor->op)) {
+    if (is_walkthrough_op(tensor->op)) {
         if (trt_node_set.count(tensor)) {
-            // Shape op is part of our TRT subgraph — walk through it
+            // Walk-through op is part of our TRT subgraph — traverse src[0]
+            // to find the true leaf.  Only src[0] — for CPY/DUP, src[1] is
+            // the destination template sharing the output data pointer.
             collect_leaves_recursive(tensor->src[0], leaf_tensors, leaf_seen, trt_node_set);
         } else {
-            // Shape op NOT in our subgraph (e.g. partial view) — its
+            // Walk-through op NOT in our subgraph (e.g. partial view) — its
             // data pointer is valid, so treat the tensor itself as a leaf.
             if (leaf_seen.insert(tensor).second) {
                 leaf_tensors.push_back(tensor);
@@ -359,7 +374,7 @@ static void collect_leaves_recursive(
         return;
     }
     // Tensor produced outside our TRT subgraph (another backend, trivial op
-    // like CONT/CPY, etc.).  Its GPU data is valid, so treat as a leaf input.
+    // like SET_ROWS, etc.).  Its GPU data is valid, so treat as a leaf input.
     if (leaf_seen.insert(tensor).second) {
         leaf_tensors.push_back(tensor);
         GGML_LOG_DEBUG("%s: external tensor op=%s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] added as leaf\n",
@@ -421,6 +436,9 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
     auto profile_now = []() { return std::chrono::high_resolution_clock::now(); };
     auto profile_start = profile_now();
 
+    // Reset scratch buffer (used for I/O aliasing workaround in Phase 4)
+    ctx->scratch.reset();
+
     // ── Phase 1a: Categorize nodes into trivial vs TRT ──
 
     std::vector<int> trt_node_indices;
@@ -430,11 +448,17 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         ggml_tensor * node = cgraph->nodes[i];
         switch (node->op) {
             case GGML_OP_NONE:
+            case GGML_OP_SET_ROWS:
+                break; // trivial — handled as CUDA ops in Phase 1b
             case GGML_OP_CPY:
             case GGML_OP_DUP:
             case GGML_OP_CONT:
-            case GGML_OP_SET_ROWS:
-                break; // trivial — handled as CUDA ops in Phase 1b
+                // Included in TRT graph as ICastLayer / IShuffleLayer.
+                // Fixes the Phase 1b ordering hazard where raw memcpy
+                // overwrote leaf inputs before the TRT engine read them.
+                trt_node_indices.push_back(i);
+                trt_node_set.insert(node);
+                break;
             case GGML_OP_VIEW:
                 // Partial views (slices) extract a subset of elements and
                 // cannot be expressed as a TRT reshape.  Treat as boundary.
@@ -465,26 +489,6 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             case GGML_OP_NONE:
                 continue;
 
-            // Copy ops — same-type D2D memcpy on the TRT stream.
-            // These must be handled here because KV cache tensors live in
-            // TRT-allocated CUDA memory that only this backend can access.
-            case GGML_OP_CPY:
-            case GGML_OP_DUP:
-            case GGML_OP_CONT:
-            {
-                if (node->src[0] && node->src[0]->data && node->data) {
-                    // Use source byte count — if types differ (F32→F16), copying
-                    // min(src, dst) bytes at least avoids out-of-bounds access,
-                    // though the result is only correct for same-type copies.
-                    const size_t nb_src = ggml_nbytes(node->src[0]);
-                    const size_t nb_dst = ggml_nbytes(node);
-                    const size_t nb = std::min(nb_src, nb_dst);
-                    CUDA_CHECK(cudaMemcpyAsync(node->data, node->src[0]->data, nb,
-                                               cudaMemcpyDeviceToDevice, ctx->stream));
-                }
-                continue;
-            }
-
             // SET_ROWS — scatter F32 source rows into destination (KV cache).
             // Must be handled here because KV cache is in TRT-allocated CUDA
             // memory.  Uses a CUDA kernel for all type combinations (F32/F16/BF16/quant).
@@ -500,7 +504,13 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
                 // Other nodes (e.g. partial VIEWs excluded from trt_node_set)
                 // would add their parents as unnecessary inputs.
                 if (trt_node_set.count(node)) {
-                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    // CPY/DUP: only src[0] provides data; src[1] is the
+                    // destination template sharing the output data pointer.
+                    // Walking src[1] would add it as a leaf input at the
+                    // same address as the output → I/O aliasing.
+                    const int n_src = (node->op == GGML_OP_CPY || node->op == GGML_OP_DUP)
+                                    ? 1 : GGML_MAX_SRC;
+                    for (int j = 0; j < n_src; j++) {
                         if (node->src[j]) {
                             collect_leaves_recursive(node->src[j], leaf_tensors, leaf_seen, trt_node_set);
                         }
@@ -680,11 +690,48 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         return GGML_STATUS_FAILED;
     }
 
-    // Bind input addresses (positional names)
+    // ── I/O aliasing guard ──
+    // The GGML allocator reuses buffer addresses for tensors with
+    // non-overlapping lifetimes.  When a TRT output (e.g. CPY writing
+    // F16 KV data) and a leaf input (e.g. F32 hidden state) share the
+    // same device address, TRT may write the output before reading the
+    // input — they're on independent network branches.  Detect these
+    // collisions and redirect the leaf input to a scratch buffer.
+
+    // Collect output addresses
+    std::unordered_set<void *> output_addrs;
+    for (int idx : trt_node_indices) {
+        ggml_tensor * node = cgraph->nodes[idx];
+        if (!is_shape_op(node->op)) {
+            output_addrs.insert(node->data);
+        }
+    }
+
+    // Detect collisions and redirect conflicting leaf inputs to scratch
+    std::vector<void *> leaf_bind_addrs(leaf_tensors.size());
+    for (size_t k = 0; k < leaf_tensors.size(); k++) {
+        void * addr = leaf_tensors[k]->data;
+        if (output_addrs.count(addr)) {
+            // Collision! Copy leaf to scratch buffer
+            size_t nbytes = ggml_nbytes(leaf_tensors[k]);
+            void * scratch_addr = ctx->scratch.alloc(nbytes);
+            CUDA_CHECK(cudaMemcpyAsync(scratch_addr, addr, nbytes,
+                                       cudaMemcpyDeviceToDevice, ctx->stream));
+            leaf_bind_addrs[k] = scratch_addr;
+
+            fprintf(stderr, "[TRT-DEBUG] I/O alias: leaf input_%zu addr %p (%zu bytes) "
+                    "collides with output, copied to scratch %p\n",
+                    k, addr, nbytes, scratch_addr);
+        } else {
+            leaf_bind_addrs[k] = addr;
+        }
+    }
+
+    // Bind input addresses (positional names), using scratch for redirected leaves
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
         char name[64];
         snprintf(name, sizeof(name), "input_%zu", k);
-        if (!exec_ctx->setTensorAddress(name, leaf_tensors[k]->data)) {
+        if (!exec_ctx->setTensorAddress(name, leaf_bind_addrs[k])) {
             GGML_LOG_ERROR("%s: failed to set input tensor address for %s\n", __func__, name);
             return GGML_STATUS_FAILED;
         }

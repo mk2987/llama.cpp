@@ -47,6 +47,7 @@ set(GGML_SOURCES_TENSORRT
     ops/shape.cpp
     ops/scale.cpp
     ops/gather.cpp
+    ops/copy.cpp
     utils/tensor-utils.cpp
     utils/type-utils.cpp
     utils/logger.cpp

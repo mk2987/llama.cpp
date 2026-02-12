@@ -104,6 +104,8 @@ ggml_backend_tensorrt_context::~ggml_backend_tensorrt_context() {
     runtime.reset();
     // logger is a non-owning pointer to the global singleton — do not delete
 
+    scratch.free_mem();
+
     if (stream) {
         cudaStreamDestroy(stream);
         stream = nullptr;
