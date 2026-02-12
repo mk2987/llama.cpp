@@ -719,9 +719,11 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
                                        cudaMemcpyDeviceToDevice, ctx->stream));
             leaf_bind_addrs[k] = scratch_addr;
 
-            fprintf(stderr, "[TRT-DEBUG] I/O alias: leaf input_%zu addr %p (%zu bytes) "
-                    "collides with output, copied to scratch %p\n",
-                    k, addr, nbytes, scratch_addr);
+            if (debug_enabled) {
+                fprintf(stderr, "[TRT-DEBUG] I/O alias: leaf input_%zu addr %p (%zu bytes) "
+                        "collides with output, copied to scratch %p\n",
+                        k, addr, nbytes, scratch_addr);
+            }
         } else {
             leaf_bind_addrs[k] = addr;
         }

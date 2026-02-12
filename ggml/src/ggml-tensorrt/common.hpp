@@ -59,7 +59,13 @@ struct scratch_buffer {
             while (new_cap < offset + nbytes) new_cap *= 2;
             void * new_ptr = nullptr;
             cudaMalloc(&new_ptr, new_cap);
-            if (ptr) cudaFree(ptr);
+            if (ptr) {
+                // Preserve existing allocations from this graph_compute call
+                if (offset > 0) {
+                    cudaMemcpy(new_ptr, ptr, offset, cudaMemcpyDeviceToDevice);
+                }
+                cudaFree(ptr);
+            }
             ptr      = new_ptr;
             capacity = new_cap;
         }
