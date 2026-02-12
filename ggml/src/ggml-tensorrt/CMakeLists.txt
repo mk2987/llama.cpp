@@ -16,6 +16,9 @@ if (NOT CUDAToolkit_FOUND)
     return()
 endif()
 
+# Enable CUDA language for .cu kernel files
+enable_language(CUDA)
+
 message(STATUS "TensorRT Backend: Building with TensorRT-RTX support")
 message(STATUS "  CUDA version: ${CUDAToolkit_VERSION}")
 message(STATUS "  TensorRT include: ${TENSORRT_INCLUDE_DIRS}")
@@ -43,6 +46,7 @@ set(GGML_SOURCES_TENSORRT
     utils/tensor-utils.cpp
     utils/type-utils.cpp
     utils/logger.cpp
+    kernels/set-rows.cu
 )
 
 # Create the backend library
@@ -51,11 +55,13 @@ ggml_add_backend_library(ggml-tensorrt
     ${GGML_SOURCES_TENSORRT}
 )
 
-# Set C++ standard (TensorRT requires C++17 or later)
+# Set C++ and CUDA standard (TensorRT requires C++17 or later)
 set_target_properties(ggml-tensorrt PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
 )
 
 # Include directories
@@ -90,3 +96,8 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -Wno-deprecated-declarations  # Suppress TensorRT-RTX header deprecation warnings
     )
 endif()
+
+# CUDA compile options
+target_compile_options(ggml-tensorrt PRIVATE
+    "$<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>"
+)
