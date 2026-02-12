@@ -12,7 +12,7 @@ namespace ggml_tensorrt {
 // In GGML, ggml_cpy(a, b) copies data from a (src[0]) to b (src[1]).
 // src[1] is the destination template — it shares the data pointer with the
 // output node and must NOT be treated as a TRT input.
-nvinfer1::ITensor* handle_cpy(NetworkBuilder* builder, const ggml_tensor* node) {
+static nvinfer1::ITensor* handle_cpy(NetworkBuilder* builder, const ggml_tensor* node) {
     GGML_ASSERT(builder != nullptr);
     GGML_ASSERT(node != nullptr);
     GGML_ASSERT(node->op == GGML_OP_CPY || node->op == GGML_OP_DUP);
@@ -68,7 +68,7 @@ nvinfer1::ITensor* handle_cpy(NetworkBuilder* builder, const ggml_tensor* node) 
 // In TRT, all tensors are logically contiguous — IShuffleLayer (PERMUTE)
 // produces a reordered but contiguous output.  CONT after PERMUTE is just
 // a reshape to the output dimensions.
-nvinfer1::ITensor* handle_cont(NetworkBuilder* builder, const ggml_tensor* node) {
+static nvinfer1::ITensor* handle_cont(NetworkBuilder* builder, const ggml_tensor* node) {
     GGML_ASSERT(builder != nullptr);
     GGML_ASSERT(node != nullptr);
     GGML_ASSERT(node->op == GGML_OP_CONT);
