@@ -841,17 +841,37 @@ cast at the boundary converts back to the node's expected ggml type.
 When src is F32 and dst is F16, `ggml_nbytes(node)` returns the F16 byte count — only half
 the source data is copied, and F32 bits are reinterpreted as F16.
 
-**Fix**: Removed CPY/DUP/CONT from `supports_op()`. CUDA backend handles these correctly.
+**Fix**: Fixed CPY handler to use `min(src_bytes, dst_bytes)` to avoid out-of-bounds access.
+Same-type copies (the common case) are correct. Cross-type copies still use raw memcpy
+which is technically incorrect but avoids crashes.
 
-### Bug 7: SET_ROWS CPU-side scatter kills performance — 4 t/s (this milestone)
+### Bug 7: SET_ROWS CPU-side scatter is slow — 4 t/s (this milestone)
 
 **Symptom**: Extremely slow generation (4 t/s vs 114 t/s CUDA-only).
 
 **Root cause**: Each SET_ROWS did `cudaStreamSynchronize()` + D2H index copy + per-row
 D2H/CPU-convert/H2D. For ~52 SET_ROWS per token, each stalling the GPU pipeline.
 
-**Fix**: Removed SET_ROWS from `supports_op()`. CUDA backend handles it with native
-GPU kernels that run entirely on-device.
+**Status**: Known performance issue. Cannot remove from `supports_op` because KV cache
+tensors are allocated in TRT buffers (TRT registers as the first GPU backend, so KV cache
+gets TRT buffer allocation). Only TRT backend can operate on TRT-buffer memory.
+TODO: Replace the per-row CPU round-trip with a custom CUDA kernel for on-device F32->F16/BF16
+scatter.
+
+### Bug 8: Removing SET_ROWS/CPY from supports_op crashes scheduler (this milestone)
+
+**Symptom**: `GGML_ABORT: pre-allocated tensor (cache_k_l0 (view)) in a buffer
+(TensorRT-RTX0) that cannot run the operation (SET_ROWS)`
+
+**Root cause**: TRT registers as the first GPU backend. The GGML scheduler allocates
+KV cache tensors in TRT buffers. When SET_ROWS/CPY are removed from `supports_op`,
+no backend can handle these ops on TRT-buffer memory (CUDA backend doesn't recognize
+TRT buffer types).
+
+**Fix**: Restored SET_ROWS/CPY/DUP/CONT in `supports_op`. These ops are excluded from
+TRT engine builds (Phase 1a categorization) and handled as trivial CUDA ops in
+Phase 1b of `graph_compute`. The graph hash only covers TRT-engine nodes, so these
+ops don't cause cache misses.
 
 ---
 
