@@ -643,6 +643,11 @@ static enum ggml_status execute_trt_segment(
         // Build engine
         EngineConfig engine_config;
 
+        // Minimum workspace floor — TRT's optimizer crashes with the assertion
+        // "maxScratchSize > 0" if workspace is zero.  64 MB is enough for
+        // most single-layer engines and prevents cascading failures.
+        static constexpr size_t min_workspace = 64ULL << 20;  // 64 MB
+
         const char* workspace_env = getenv("GGML_TENSORRT_WORKSPACE_MB");
         if (workspace_env) {
             engine_config.max_workspace_size = (size_t)atoi(workspace_env) << 20;
@@ -655,17 +660,32 @@ static enum ggml_status execute_trt_segment(
             }
         }
 
+        // Enforce minimum — never pass 0 workspace to TRT
+        if (engine_config.max_workspace_size < min_workspace) {
+            engine_config.max_workspace_size = min_workspace;
+        }
+
         const char* aux_streams_env = getenv("GGML_TENSORRT_AUX_STREAMS");
         if (aux_streams_env) {
             engine_config.max_aux_streams = atoi(aux_streams_env);
         }
 
+        // Check if there's enough free VRAM to attempt the build.
+        // Building with insufficient memory can leak CUDA resources and
+        // cause cascading failures for subsequent builds.
         {
             size_t free_bytes = 0, total_bytes = 0;
             cudaMemGetInfo(&free_bytes, &total_bytes);
             GGML_LOG_WARN("%s: building engine (segment %" PRId64 ", hash 0x%016" PRIx64 ", %zu nodes, workspace %zu MB, GPU free %zu MB / %zu MB)\n",
                 __func__, segment_id, hash, trt_node_indices.size(),
                 engine_config.max_workspace_size >> 20, free_bytes >> 20, total_bytes >> 20);
+
+            if (free_bytes < min_workspace) {
+                GGML_LOG_ERROR("%s: insufficient free VRAM for engine build "
+                    "(%zu MB free, need at least %zu MB workspace)\n",
+                    __func__, free_bytes >> 20, min_workspace >> 20);
+                return GGML_STATUS_FAILED;
+            }
         }
 
         engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config);
