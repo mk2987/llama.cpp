@@ -1215,6 +1215,37 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
                     return false;
             }
         }
+        case GGML_OP_ROPE:
+        {
+            // Output must be a supported compute type
+            if (!is_supported_compute_type(op->type)) {
+                return false;
+            }
+            // src[0] (Q/K data) must be a supported compute type
+            if (!op->src[0] || !is_supported_compute_type(op->src[0]->type)) {
+                return false;
+            }
+            // src[1] (positions) must be I32
+            if (!op->src[1] || op->src[1]->type != GGML_TYPE_I32) {
+                return false;
+            }
+            // Reject freq_factors (src[2]) — not needed for most models
+            if (op->src[2] != nullptr) {
+                return false;
+            }
+            // Only NORMAL and NEOX modes
+            int mode = ((const int32_t *)op->op_params)[2];
+            if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+                return false;
+            }
+            // Reject YaRN (complex frequency interpolation)
+            float ext_factor = 0.0f;
+            memcpy(&ext_factor, (const float *)op->op_params + 7, sizeof(float));
+            if (ext_factor != 0.0f) {
+                return false;
+            }
+            return true;
+        }
         case GGML_OP_UNARY:
         {
             // Output must be a supported compute type
