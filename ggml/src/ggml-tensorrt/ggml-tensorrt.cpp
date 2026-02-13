@@ -522,8 +522,19 @@ static enum ggml_status execute_trt_segment(
     };
 
     // ── Engine cache lookup ──
+    //
+    // The graph hash covers ops, shapes, and types but NOT data addresses.
+    // Different layers share identical graph structure yet the GGML allocator
+    // assigns different addresses, causing last_writer_for_addr to produce
+    // different output configurations (count and position).  Mix the output
+    // pattern into the hash so different configurations get distinct engines.
 
     uint64_t hash = compute_graph_hash(cgraph, trt_node_indices);
+    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+        if (is_bound_output(ni, cgraph->nodes[trt_node_indices[ni]])) {
+            hash ^= (ni + 1) * GGML_TENSORRT_HASH_GOLDEN_RATIO;
+        }
+    }
 
     nvinfer1::ICudaEngine* engine = ctx->engine_mgr->get_cached_engine(hash);
 
