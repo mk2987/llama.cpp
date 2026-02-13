@@ -331,6 +331,26 @@ static bool is_walkthrough_op(ggml_op op) {
     return is_shape_op(op) || op == GGML_OP_CPY || op == GGML_OP_DUP || op == GGML_OP_CONT;
 }
 
+// Check if an op is a trivial CUDA op executed outside the TRT engine.
+// These are handled directly by custom CUDA kernels in graph_compute.
+static bool is_trivial_op(ggml_op op) {
+    return op == GGML_OP_SET_ROWS;
+}
+
+// Check if a tensor's op is TRT-compatible (built into the TRT engine).
+// Uses NetworkBuilder::is_operation_supported for compute/shape/copy ops,
+// plus the partial VIEW guard (partial views are subgraph boundaries).
+static bool is_trt_compatible(const ggml_tensor * node) {
+    if (node->op == GGML_OP_VIEW) {
+        // Partial views (slices) extract a subset of elements and cannot be
+        // expressed as a TRT reshape.  Only full views (same element count)
+        // are reshapes → TRT node.
+        return node->src[0] &&
+               ggml_nelements(node) == ggml_nelements(node->src[0]);
+    }
+    return NetworkBuilder::is_operation_supported(node->op);
+}
+
 // Recursively collect true leaf inputs, walking through shape op chains.
 // Shape ops (VIEW, RESHAPE, PERMUTE, TRANSPOSE) pass through to their src[0].
 // GGML_OP_NONE tensors are leaves.  Tensors produced by other TRT nodes in the
@@ -416,138 +436,61 @@ static std::vector<float> debug_read_tensor_head(const ggml_tensor * tensor, cud
     return result;
 }
 
-static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    ggml_backend_tensorrt_context * ctx = (ggml_backend_tensorrt_context *) backend->context;
-
-    CUDA_CHECK(cudaSetDevice(ctx->device));
-
-    // Instrumentation: env var checks (cached on first call)
-    static const bool debug_enabled  = (getenv("GGML_TENSORRT_DEBUG") != nullptr &&
-                                         atoi(getenv("GGML_TENSORRT_DEBUG")) != 0);
-    static const bool profile_enabled = (getenv("GGML_TENSORRT_PROFILE") != nullptr &&
-                                          atoi(getenv("GGML_TENSORRT_PROFILE")) != 0);
-
-    static int64_t call_counter = 0;
-    int64_t call_id = call_counter++;
-
+// Execute one TRT segment: collect leaves → hash → build/cache engine →
+// I/O alias guard → bind inputs/outputs → enqueueV3 → debug logging.
+// Each segment is a contiguous run of TRT-compatible nodes between trivial
+// op boundaries.  The segment has its own leaf set and cached engine.
+static enum ggml_status execute_trt_segment(
+    ggml_backend_tensorrt_context * ctx,
+    const ggml_cgraph * cgraph,
+    const std::vector<int> & trt_node_indices,
+    const std::unordered_set<const ggml_tensor *> & trt_node_set,
+    bool debug_enabled,
+    int64_t segment_id
+) {
     // Address tracking for debug mode (detect address changes between calls)
     static std::unordered_map<uint64_t, std::vector<void*>> prev_input_addrs;
 
-    auto profile_now = []() { return std::chrono::high_resolution_clock::now(); };
-    auto profile_start = profile_now();
-
-    // Reset scratch buffer (used for I/O aliasing workaround in Phase 4)
-    ctx->scratch.reset();
-
-    // ── Phase 1a: Categorize nodes into trivial vs TRT ──
-
-    std::vector<int> trt_node_indices;
-    std::unordered_set<const ggml_tensor*> trt_node_set;
-
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_tensor * node = cgraph->nodes[i];
-        switch (node->op) {
-            case GGML_OP_NONE:
-            case GGML_OP_SET_ROWS:
-                break; // trivial — handled as CUDA ops in Phase 1b
-            case GGML_OP_CPY:
-            case GGML_OP_DUP:
-            case GGML_OP_CONT:
-                // Included in TRT graph as ICastLayer / IShuffleLayer.
-                // Fixes the Phase 1b ordering hazard where raw memcpy
-                // overwrote leaf inputs before the TRT engine read them.
-                trt_node_indices.push_back(i);
-                trt_node_set.insert(node);
-                break;
-            case GGML_OP_VIEW:
-                // Partial views (slices) extract a subset of elements and
-                // cannot be expressed as a TRT reshape.  Treat as boundary.
-                // Full views (same element count) are reshapes → TRT node.
-                if (node->src[0] &&
-                    ggml_nelements(node) != ggml_nelements(node->src[0])) {
-                    break; // partial view — subgraph boundary
-                }
-                trt_node_indices.push_back(i);
-                trt_node_set.insert(node);
-                break;
-            default:
-                trt_node_indices.push_back(i);
-                trt_node_set.insert(node);
-                break;
-        }
-    }
-
-    // ── Phase 1b: Execute trivial ops and collect leaf inputs ──
+    // ── Collect leaf inputs for this segment ──
 
     std::vector<const ggml_tensor*> leaf_tensors;
     std::unordered_set<const ggml_tensor*> leaf_seen;
 
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_tensor * node = cgraph->nodes[i];
-
-        switch (node->op) {
-            case GGML_OP_NONE:
-                continue;
-
-            // SET_ROWS — scatter F32 source rows into destination (KV cache).
-            // Must be handled here because KV cache is in TRT-allocated CUDA
-            // memory.  Uses a CUDA kernel for all type combinations (F32/F16/BF16/quant).
-            case GGML_OP_SET_ROWS:
-            {
-                ggml_tensorrt_set_rows(node->src[0], node->src[1], node, ctx->stream);
-                continue;
-            }
-
-            default:
-            {
-                // Only collect leaf inputs for nodes in the TRT subgraph.
-                // Other nodes (e.g. partial VIEWs excluded from trt_node_set)
-                // would add their parents as unnecessary inputs.
-                if (trt_node_set.count(node)) {
-                    // CPY/DUP: only src[0] provides data; src[1] is the
-                    // destination template sharing the output data pointer.
-                    // Walking src[1] would add it as a leaf input at the
-                    // same address as the output → I/O aliasing.
-                    const int n_src = (node->op == GGML_OP_CPY || node->op == GGML_OP_DUP)
-                                    ? 1 : GGML_MAX_SRC;
-                    for (int j = 0; j < n_src; j++) {
-                        if (node->src[j]) {
-                            collect_leaves_recursive(node->src[j], leaf_tensors, leaf_seen, trt_node_set);
-                        }
-                    }
-                }
-                break;
+    for (int idx : trt_node_indices) {
+        const ggml_tensor * node = cgraph->nodes[idx];
+        // CPY/DUP: only src[0] provides data; src[1] is the destination
+        // template sharing the output data pointer.  Walking src[1] would
+        // add it as a leaf input at the same address as the output → I/O aliasing.
+        const int n_src = (node->op == GGML_OP_CPY || node->op == GGML_OP_DUP)
+                        ? 1 : GGML_MAX_SRC;
+        for (int j = 0; j < n_src; j++) {
+            if (node->src[j]) {
+                collect_leaves_recursive(node->src[j], leaf_tensors, leaf_seen, trt_node_set);
             }
         }
     }
 
-    // No compute nodes — all handled above
     if (trt_node_indices.empty()) {
         return GGML_STATUS_SUCCESS;
     }
 
-    auto phase1_end = profile_now();
-
-    // ── Phase 2: Engine cache lookup ──
+    // ── Engine cache lookup ──
 
     uint64_t hash = compute_graph_hash(cgraph, trt_node_indices);
 
     nvinfer1::ICudaEngine* engine = ctx->engine_mgr->get_cached_engine(hash);
 
-    auto phase2_end = profile_now();
     bool was_cache_miss = (engine == nullptr);
 
-    // ── Phase 3: Cache miss — build engine ──
+    // ── Cache miss — build engine ──
 
     if (engine == nullptr) {
-        // ── Diagnostic dump: log the subgraph structure before building ──
-        // Controlled by GGML_TENSORRT_DUMP_GRAPH=1.  Uses fprintf(stderr)
-        // directly to bypass GGML's log callback which llama-cli filters.
+        // Diagnostic dump: log the subgraph structure before building
         static const bool dump_graph = (getenv("GGML_TENSORRT_DUMP_GRAPH") != nullptr &&
                                         atoi(getenv("GGML_TENSORRT_DUMP_GRAPH")) != 0);
         if (dump_graph) {
-            fprintf(stderr, "[TensorRT-RTX] building TRT subgraph — hash 0x%016" PRIx64 ", %zu leaves, %zu nodes\n",
-                hash, leaf_tensors.size(), trt_node_indices.size());
+            fprintf(stderr, "[TensorRT-RTX] building TRT segment %" PRId64 " — hash 0x%016" PRIx64 ", %zu leaves, %zu nodes\n",
+                segment_id, hash, leaf_tensors.size(), trt_node_indices.size());
 
             for (size_t k = 0; k < leaf_tensors.size(); k++) {
                 const ggml_tensor * leaf = leaf_tensors[k];
@@ -561,7 +504,6 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
                 const ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
                 const char * op_str = ggml_op_name(node->op);
 
-                // For UNARY ops, append the sub-op name
                 char op_buf[64];
                 if (node->op == GGML_OP_UNARY) {
                     snprintf(op_buf, sizeof(op_buf), "UNARY(%s)",
@@ -611,10 +553,7 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             }
         }
 
-        // Process all TRT nodes (shape ops + compute ops)
-        // Only mark compute ops (non-shape-ops) as network outputs.
-        // Shape ops share data pointers with their source in GGML,
-        // so binding them as outputs would create duplicate address bindings.
+        // Process all TRT nodes — only mark compute ops (non-shape) as outputs
         int output_idx = 0;
         for (int idx : trt_node_indices) {
             ggml_tensor * node = cgraph->nodes[idx];
@@ -626,11 +565,7 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
                 return GGML_STATUS_FAILED;
             }
 
-            // Only mark compute ops as outputs
             if (!is_shape_op(node->op)) {
-                // Cast TRT output to match GGML's expected output type.
-                // E.g. ggml_mul_mat always produces F32 but TRT with BF16
-                // inputs produces BF16 output in strongly-typed mode.
                 nvinfer1::DataType expected_type = ggml_type_to_tensorrt(node->type);
                 output = net_builder.maybe_cast(output, expected_type);
 
@@ -644,7 +579,6 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         // Build engine
         EngineConfig engine_config;
 
-        // Workspace: use env var override, else cap at 256 MB or 25% of free VRAM
         const char* workspace_env = getenv("GGML_TENSORRT_WORKSPACE_MB");
         if (workspace_env) {
             engine_config.max_workspace_size = (size_t)atoi(workspace_env) << 20;
@@ -665,8 +599,8 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         {
             size_t free_bytes = 0, total_bytes = 0;
             cudaMemGetInfo(&free_bytes, &total_bytes);
-            GGML_LOG_WARN("%s: building engine (hash 0x%016" PRIx64 ", %zu nodes, workspace %zu MB, GPU free %zu MB / %zu MB)\n",
-                __func__, hash, trt_node_indices.size(),
+            GGML_LOG_WARN("%s: building engine (segment %" PRId64 ", hash 0x%016" PRIx64 ", %zu nodes, workspace %zu MB, GPU free %zu MB / %zu MB)\n",
+                __func__, segment_id, hash, trt_node_indices.size(),
                 engine_config.max_workspace_size >> 20, free_bytes >> 20, total_bytes >> 20);
         }
 
@@ -676,13 +610,10 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             return GGML_STATUS_FAILED;
         }
 
-        // Cache the engine (transfers ownership)
         ctx->engine_mgr->cache_engine(hash, engine);
     }
 
-    auto phase3_end = profile_now();
-
-    // ── Phase 4: Execute ──
+    // ── Execute ──
 
     nvinfer1::IExecutionContext* exec_ctx = ctx->engine_mgr->get_or_create_context(hash);
     if (!exec_ctx) {
@@ -691,14 +622,6 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
     }
 
     // ── I/O aliasing guard ──
-    // The GGML allocator reuses buffer addresses for tensors with
-    // non-overlapping lifetimes.  When a TRT output (e.g. CPY writing
-    // F16 KV data) and a leaf input (e.g. F32 hidden state) share the
-    // same device address, TRT may write the output before reading the
-    // input — they're on independent network branches.  Detect these
-    // collisions and redirect the leaf input to a scratch buffer.
-
-    // Collect output addresses
     std::unordered_set<void *> output_addrs;
     for (int idx : trt_node_indices) {
         ggml_tensor * node = cgraph->nodes[idx];
@@ -707,12 +630,10 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         }
     }
 
-    // Detect collisions and redirect conflicting leaf inputs to scratch
     std::vector<void *> leaf_bind_addrs(leaf_tensors.size());
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
         void * addr = leaf_tensors[k]->data;
         if (output_addrs.count(addr)) {
-            // Collision! Copy leaf to scratch buffer
             size_t nbytes = ggml_nbytes(leaf_tensors[k]);
             void * scratch_addr = ctx->scratch.alloc(nbytes);
             CUDA_CHECK(cudaMemcpyAsync(scratch_addr, addr, nbytes,
@@ -720,16 +641,16 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             leaf_bind_addrs[k] = scratch_addr;
 
             if (debug_enabled) {
-                fprintf(stderr, "[TRT-DEBUG] I/O alias: leaf input_%zu addr %p (%zu bytes) "
+                fprintf(stderr, "[TRT-DEBUG] I/O alias: seg %" PRId64 " leaf input_%zu addr %p (%zu bytes) "
                         "collides with output, copied to scratch %p\n",
-                        k, addr, nbytes, scratch_addr);
+                        segment_id, k, addr, nbytes, scratch_addr);
             }
         } else {
             leaf_bind_addrs[k] = addr;
         }
     }
 
-    // Bind input addresses (positional names), using scratch for redirected leaves
+    // Bind input addresses
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
         char name[64];
         snprintf(name, sizeof(name), "input_%zu", k);
@@ -739,7 +660,7 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         }
     }
 
-    // Bind output addresses — only for compute ops (skip shape ops)
+    // Bind output addresses — only compute ops (skip shape ops)
     int n_outputs = 0;
     for (int idx : trt_node_indices) {
         ggml_tensor * node = cgraph->nodes[idx];
@@ -755,10 +676,10 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         n_outputs++;
     }
 
-    // ── Debug: log input data before execution ──
+    // Debug: log input data before execution
     if (debug_enabled) {
-        fprintf(stderr, "[TRT-DEBUG] call #%" PRId64 ", hash 0x%016" PRIx64 ", inputs: %zu, outputs: %d\n",
-            call_id, hash, leaf_tensors.size(), n_outputs);
+        fprintf(stderr, "[TRT-DEBUG] seg %" PRId64 ", hash 0x%016" PRIx64 ", inputs: %zu, outputs: %d\n",
+            segment_id, hash, leaf_tensors.size(), n_outputs);
 
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
             const ggml_tensor * leaf = leaf_tensors[k];
@@ -796,11 +717,11 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
     // Execute
     if (!exec_ctx->enqueueV3(ctx->stream)) {
-        GGML_LOG_ERROR("%s: failed to execute TensorRT engine\n", __func__);
+        GGML_LOG_ERROR("%s: failed to execute TensorRT engine (segment %" PRId64 ")\n", __func__, segment_id);
         return GGML_STATUS_FAILED;
     }
 
-    // ── Debug: log output data after execution ──
+    // Debug: log output data after execution
     if (debug_enabled) {
         CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
         int out_idx = 0;
@@ -824,28 +745,134 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         }
     }
 
-    auto phase4_end = profile_now();
+    (void)was_cache_miss; // used only for profiling, which is done at graph_compute level
 
-    // ── Profile: log phase timings ──
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_tensorrt_context * ctx = (ggml_backend_tensorrt_context *) backend->context;
+
+    CUDA_CHECK(cudaSetDevice(ctx->device));
+
+    // Instrumentation: env var checks (cached on first call)
+    static const bool debug_enabled  = (getenv("GGML_TENSORRT_DEBUG") != nullptr &&
+                                         atoi(getenv("GGML_TENSORRT_DEBUG")) != 0);
+    static const bool profile_enabled = (getenv("GGML_TENSORRT_PROFILE") != nullptr &&
+                                          atoi(getenv("GGML_TENSORRT_PROFILE")) != 0);
+
+    static int64_t call_counter = 0;
+    int64_t call_id = call_counter++;
+
+    auto profile_now = []() { return std::chrono::high_resolution_clock::now(); };
+    auto profile_start = profile_now();
+
+    // Reset scratch buffer (shared across all segments this call)
+    ctx->scratch.reset();
+
+    // ── Segmented execution ──
+    //
+    // Walk nodes in topological order.  Consecutive TRT-compatible nodes
+    // accumulate into a segment.  Trivial ops (SET_ROWS) that depend on
+    // the current segment are deferred.  When a TRT node appears after
+    // deferred trivial ops, we flush the current segment (execute its TRT
+    // engine + run deferred trivial ops) before starting a new segment.
+    //
+    // This correctly handles implicit memory dependencies through shared
+    // buffers (KV cache) where SET_ROWS writes data that later TRT nodes
+    // read via VIEW — there's no src[] edge, the dependency is positional.
+
+    std::vector<int>                        seg_trt_indices;
+    std::unordered_set<const ggml_tensor *> seg_trt_set;
+    std::vector<ggml_tensor *>              pending_trivial;
+    int64_t segment_id = 0;
+    int64_t n_segments = 0;
+
+    auto flush_segment = [&]() -> ggml_status {
+        if (!seg_trt_indices.empty()) {
+            ggml_status status = execute_trt_segment(
+                ctx, cgraph, seg_trt_indices, seg_trt_set,
+                debug_enabled, call_id * 100 + segment_id);
+            if (status != GGML_STATUS_SUCCESS) return status;
+            segment_id++;
+            n_segments++;
+        }
+        // Execute deferred trivial ops (SET_ROWS) — their inputs are now
+        // produced by the TRT engine we just ran.
+        for (ggml_tensor * node : pending_trivial) {
+            if (node->op == GGML_OP_SET_ROWS) {
+                ggml_tensorrt_set_rows(node->src[0], node->src[1], node, ctx->stream);
+            }
+        }
+        seg_trt_indices.clear();
+        seg_trt_set.clear();
+        pending_trivial.clear();
+        return GGML_STATUS_SUCCESS;
+    };
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+
+        if (node->op == GGML_OP_NONE) continue;
+
+        if (is_trivial_op(node->op)) {
+            // Check if any source was produced by the current TRT segment.
+            // If so, defer execution until after the segment's engine runs.
+            // Otherwise, execute immediately (data from a previous subgraph).
+            bool depends_on_segment = false;
+            for (int j = 0; j < GGML_MAX_SRC && node->src[j]; j++) {
+                if (seg_trt_set.count(node->src[j])) {
+                    depends_on_segment = true;
+                    break;
+                }
+            }
+            if (depends_on_segment) {
+                pending_trivial.push_back(node);
+            } else {
+                // No dependency on current segment — execute now.
+                // (Data comes from previous subgraph or host.)
+                ggml_tensorrt_set_rows(node->src[0], node->src[1], node, ctx->stream);
+            }
+            continue;
+        }
+
+        if (is_trt_compatible(node)) {
+            // If there are pending trivial ops, we must flush the current
+            // segment first.  The trivial ops write to shared buffers (KV
+            // cache) that this new TRT node will read via implicit memory
+            // dependencies (VIEW, no src[] edge).
+            if (!pending_trivial.empty()) {
+                ggml_status s = flush_segment();
+                if (s != GGML_STATUS_SUCCESS) return s;
+            }
+            seg_trt_indices.push_back(i);
+            seg_trt_set.insert(node);
+            continue;
+        }
+
+        // Unrecognized op (e.g. partial VIEW treated as boundary) — skip.
+        // It is not added to any segment.
+    }
+
+    // Flush the final segment
+    ggml_status final_status = flush_segment();
+
+    auto compute_end = profile_now();
+
+    // ── Profile: log timing and segment info ──
     if (profile_enabled) {
         auto to_ms = [](auto start, auto end) {
             return std::chrono::duration<double, std::milli>(end - start).count();
         };
-        fprintf(stderr, "[TRT-PROF] call #%" PRId64 ": hash=0x%016" PRIx64 ", nodes=%zu, leaves=%zu, "
-            "phase1=%.2fms, phase2=%.2fms, phase3=%.2fms (%s), phase4=%.2fms\n",
-            call_id, hash, trt_node_indices.size(), leaf_tensors.size(),
-            to_ms(profile_start, phase1_end),
-            to_ms(phase1_end, phase2_end),
-            to_ms(phase2_end, phase3_end),
-            was_cache_miss ? "miss" : "hit",
-            to_ms(phase3_end, phase4_end));
+        fprintf(stderr, "[TRT-PROF] call #%" PRId64 ": segments=%" PRId64 ", total=%.2fms\n",
+            call_id, n_segments, to_ms(profile_start, compute_end));
 
         fprintf(stderr, "[TRT-PROF] cache: hits=%" PRId64 ", misses=%" PRId64 ", total_build_time=%.0fms\n",
             ctx->engine_mgr->cache_hits, ctx->engine_mgr->cache_misses,
             ctx->engine_mgr->total_build_time_ms);
     }
 
-    return GGML_STATUS_SUCCESS;
+    return final_status;
 }
 
 static const ggml_backend_i ggml_backend_tensorrt_interface = {
