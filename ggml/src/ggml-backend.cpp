@@ -14,6 +14,7 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1444,6 +1445,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // ── GGML_SCHED_DEBUG: dump split structure before execution ──
+    static const int sched_debug = (getenv("GGML_SCHED_DEBUG") != NULL) ? atoi(getenv("GGML_SCHED_DEBUG")) : 0;
+    if (sched_debug) {
+        int total_nodes = 0;
+        for (int i = 0; i < sched->n_splits; i++) {
+            total_nodes += splits[i].graph.n_nodes;
+        }
+        fprintf(stderr, "[SCHED] graph has %d splits, %d nodes total\n",
+            sched->n_splits, total_nodes);
+        for (int i = 0; i < sched->n_splits; i++) {
+            struct ggml_backend_sched_split * s = &splits[i];
+            fprintf(stderr, "[SCHED]   split[%d]: backend=%-24s nodes[%d..%d] (%3d nodes)  inputs=%d\n",
+                i, ggml_backend_name(sched->backends[s->backend_id]),
+                s->i_start, s->i_end - 1, s->graph.n_nodes, s->n_inputs);
+            // At verbosity >= 2, list every node in the split
+            if (sched_debug >= 2) {
+                for (int j = 0; j < s->graph.n_nodes; j++) {
+                    struct ggml_tensor * node = s->graph.nodes[j];
+                    fprintf(stderr, "[SCHED]     node[%3d] op=%-16s type=%-4s shape=[%4" PRId64 ",%4" PRId64 ",%4" PRId64 ",%4" PRId64 "] name=%s\n",
+                        j, ggml_op_name(node->op), ggml_type_name(node->type),
+                        node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                        node->name);
+                }
+            }
+        }
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1580,6 +1608,49 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+
+            // ── GGML_SCHED_DEBUG >= 2: dump node data after each split's graph_compute ──
+            if (sched_debug >= 2) {
+                ggml_backend_synchronize(split_backend);
+                fprintf(stderr, "[SCHED] split[%d] computed (%s), dumping %d nodes:\n",
+                    split_id, ggml_backend_name(split_backend), split->graph.n_nodes);
+                for (int j = 0; j < split->graph.n_nodes; j++) {
+                    struct ggml_tensor * node = split->graph.nodes[j];
+                    int64_t nelements = ggml_nelements(node);
+                    int n = (int)(nelements < 8 ? nelements : 8);
+                    float vals[8] = {0};
+                    bool got_data = false;
+                    if (n > 0 && node->data && node->buffer) {
+                        if (node->type == GGML_TYPE_F32) {
+                            ggml_backend_tensor_get(node, vals, 0, n * sizeof(float));
+                            got_data = true;
+                        } else if (node->type == GGML_TYPE_F16) {
+                            ggml_fp16_t buf[8];
+                            ggml_backend_tensor_get(node, buf, 0, n * sizeof(ggml_fp16_t));
+                            ggml_fp16_to_fp32_row(buf, vals, n);
+                            got_data = true;
+                        } else if (node->type == GGML_TYPE_BF16) {
+                            ggml_bf16_t buf[8];
+                            ggml_backend_tensor_get(node, buf, 0, n * sizeof(ggml_bf16_t));
+                            ggml_bf16_to_fp32_row(buf, vals, n);
+                            got_data = true;
+                        }
+                    }
+                    fprintf(stderr, "[SCHED]   node[%3d] op=%-16s type=%-4s shape=[%4" PRId64 ",%4" PRId64 ",%4" PRId64 ",%4" PRId64 "] addr=%p",
+                        j, ggml_op_name(node->op), ggml_type_name(node->type),
+                        node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                        node->data);
+                    if (got_data) {
+                        fprintf(stderr, " first=[");
+                        for (int v = 0; v < n; v++) {
+                            if (v > 0) fprintf(stderr, ", ");
+                            fprintf(stderr, "%.6g", (double)vals[v]);
+                        }
+                        fprintf(stderr, "]");
+                    }
+                    fprintf(stderr, "\n");
+                }
             }
         } else {
             // similar to ggml_backend_compare_graph_backend

@@ -803,6 +803,8 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
                                          atoi(getenv("GGML_TENSORRT_DEBUG")) != 0);
     static const bool profile_enabled = (getenv("GGML_TENSORRT_PROFILE") != nullptr &&
                                           atoi(getenv("GGML_TENSORRT_PROFILE")) != 0);
+    static const bool dump_subgraph  = (getenv("GGML_TENSORRT_DUMP_SUBGRAPH") != nullptr &&
+                                         atoi(getenv("GGML_TENSORRT_DUMP_SUBGRAPH")) != 0);
 
     static int64_t call_counter = 0;
     int64_t call_id = call_counter++;
@@ -899,6 +901,30 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
 
     // Flush the final segment
     ggml_status final_status = flush_segment();
+
+    // ── Subgraph dump: log all node data after all segments execute ──
+    if (dump_subgraph) {
+        CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+        fprintf(stderr, "[TRT-SUBGRAPH] call #%" PRId64 ", %d nodes, %" PRId64 " segments\n",
+            call_id, cgraph->n_nodes, n_segments);
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            auto vals = debug_read_tensor_head(node, ctx->stream, 8);
+            fprintf(stderr, "[TRT-SUBGRAPH]   node[%3d] op=%-16s type=%-4s shape=[%4" PRId64 ",%4" PRId64 ",%4" PRId64 ",%4" PRId64 "] addr=%p",
+                i, ggml_op_name(node->op), ggml_type_name(node->type),
+                node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                node->data);
+            if (!vals.empty()) {
+                fprintf(stderr, " first=[");
+                for (size_t v = 0; v < vals.size(); v++) {
+                    if (v > 0) fprintf(stderr, ", ");
+                    fprintf(stderr, "%.6g", vals[v]);
+                }
+                fprintf(stderr, "]");
+            }
+            fprintf(stderr, "\n");
+        }
+    }
 
     auto compute_end = profile_now();
 
