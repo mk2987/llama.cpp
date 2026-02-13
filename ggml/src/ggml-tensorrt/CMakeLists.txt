@@ -44,6 +44,7 @@ set(GGML_SOURCES_TENSORRT
     ops/softmax.cpp
     ops/attention.cpp
     ops/unary.cpp
+    ops/glu.cpp
     ops/shape.cpp
     ops/scale.cpp
     ops/gather.cpp

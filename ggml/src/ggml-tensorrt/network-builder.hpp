@@ -144,4 +144,18 @@ nvinfer1::ITensor* handle_scale(NetworkBuilder* builder, const ggml_tensor* node
 // Gather rows (embedding lookup)
 nvinfer1::ITensor* handle_get_rows(NetworkBuilder* builder, const ggml_tensor* node);
 
+// GLU (gated linear unit) operations
+nvinfer1::ITensor* handle_glu(NetworkBuilder* builder, const ggml_tensor* node);
+
+// Shared activation helper — applies an activation function to a TRT tensor.
+// Used by both unary ops and GLU.  Returns nullptr on failure.
+// Supported activations: SILU, GELU, GELU_ERF, RELU, TANH, SIGMOID, EXP, GELU_QUICK
+nvinfer1::ITensor* apply_activation(
+    nvinfer1::INetworkDefinition* network,
+    NetworkBuilder* builder,
+    nvinfer1::ITensor* input,
+    enum ggml_unary_op activation,
+    const char* name_prefix
+);
+
 } // namespace ggml_tensorrt

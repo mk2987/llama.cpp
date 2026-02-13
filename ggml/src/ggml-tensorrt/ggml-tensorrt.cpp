@@ -294,8 +294,12 @@ static void ggml_backend_tensorrt_get_tensor_async(ggml_backend_t backend, const
 }
 
 static bool ggml_backend_tensorrt_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
-    (void) backend_src;
-    (void) backend_dst;
+    // Only handle TRT→TRT copies (same stream, ordered).
+    // Cross-backend copies (e.g. CUDA→TRT) need source stream sync —
+    // returning false lets the scheduler's fallback path handle it.
+    if (!ggml_backend_is_tensorrt(backend_src)) {
+        return false;
+    }
 
     GGML_ASSERT(src->buffer && dst->buffer);
 
@@ -551,6 +555,10 @@ static enum ggml_status execute_trt_segment(
                 if (node->op == GGML_OP_UNARY) {
                     snprintf(op_buf, sizeof(op_buf), "UNARY(%s)",
                         ggml_unary_op_name(ggml_get_unary_op(node)));
+                    op_str = op_buf;
+                } else if (node->op == GGML_OP_GLU) {
+                    snprintf(op_buf, sizeof(op_buf), "GLU(%s)",
+                        ggml_glu_op_name(ggml_get_glu_op(node)));
                     op_str = op_buf;
                 }
 
@@ -1185,6 +1193,32 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_EXP:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        case GGML_OP_GLU:
+        {
+            // Output must be a supported compute type
+            if (!is_supported_compute_type(op->type)) {
+                return false;
+            }
+            // All sources must be supported compute types
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                if (op->src[i] && !is_supported_compute_type(op->src[i]->type)) {
+                    return false;
+                }
+            }
+            // Only supported GLU sub-ops
+            enum ggml_glu_op gop = ggml_get_glu_op(op);
+            switch (gop) {
+                case GGML_GLU_OP_SWIGLU:
+                case GGML_GLU_OP_GEGLU:
+                case GGML_GLU_OP_GEGLU_ERF:
+                case GGML_GLU_OP_REGLU:
+                case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SWIGLU_OAI:
                     return true;
                 default:
                     return false;

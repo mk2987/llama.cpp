@@ -3,6 +3,7 @@
 #include "utils/type-utils.hpp"
 #include "ggml-impl.h"
 
+#include <cmath>
 #include <cstring>
 #include <sstream>
 
@@ -274,6 +275,151 @@ nvinfer1::ITensor* NetworkBuilder::pad_to_ndims(
     }
     shuffle->setReshapeDimensions(new_dims);
     return shuffle->getOutput(0);
+}
+
+nvinfer1::ITensor* apply_activation(
+    nvinfer1::INetworkDefinition* network,
+    NetworkBuilder* builder,
+    nvinfer1::ITensor* input,
+    enum ggml_unary_op activation,
+    const char* name_prefix
+) {
+    GGML_ASSERT(network != nullptr);
+    GGML_ASSERT(input != nullptr);
+
+    switch (activation) {
+        case GGML_UNARY_OP_RELU:
+        {
+            auto* layer = network->addActivation(*input, nvinfer1::ActivationType::kRELU);
+            if (!layer) {
+                GGML_LOG_ERROR("%s: failed to create RELU layer\n", __func__);
+                return nullptr;
+            }
+            layer->setName((std::string(name_prefix) + "_relu").c_str());
+            return layer->getOutput(0);
+        }
+
+        case GGML_UNARY_OP_TANH:
+        {
+            auto* layer = network->addActivation(*input, nvinfer1::ActivationType::kTANH);
+            if (!layer) {
+                GGML_LOG_ERROR("%s: failed to create TANH layer\n", __func__);
+                return nullptr;
+            }
+            layer->setName((std::string(name_prefix) + "_tanh").c_str());
+            return layer->getOutput(0);
+        }
+
+        case GGML_UNARY_OP_SIGMOID:
+        {
+            auto* layer = network->addActivation(*input, nvinfer1::ActivationType::kSIGMOID);
+            if (!layer) {
+                GGML_LOG_ERROR("%s: failed to create SIGMOID layer\n", __func__);
+                return nullptr;
+            }
+            layer->setName((std::string(name_prefix) + "_sigmoid").c_str());
+            return layer->getOutput(0);
+        }
+
+        case GGML_UNARY_OP_SILU:
+        {
+            // SiLU = x * sigmoid(x)
+            auto* sigmoid_layer = network->addActivation(*input, nvinfer1::ActivationType::kSIGMOID);
+            if (!sigmoid_layer) {
+                GGML_LOG_ERROR("%s: failed to create SIGMOID layer for SILU\n", __func__);
+                return nullptr;
+            }
+            nvinfer1::ITensor* sigmoid_out = sigmoid_layer->getOutput(0);
+
+            auto* mul_layer = network->addElementWise(
+                *input, *sigmoid_out, nvinfer1::ElementWiseOperation::kPROD);
+            if (!mul_layer) {
+                GGML_LOG_ERROR("%s: failed to create MUL layer for SILU\n", __func__);
+                return nullptr;
+            }
+            mul_layer->setName((std::string(name_prefix) + "_silu").c_str());
+            return mul_layer->getOutput(0);
+        }
+
+        case GGML_UNARY_OP_GELU:
+        case GGML_UNARY_OP_GELU_ERF:
+        {
+            // GELU = x * 0.5 * (1 + erf(x / sqrt(2)))
+            float inv_sqrt2 = 1.0f / sqrtf(2.0f);
+            nvinfer1::ITensor* scale_tensor = builder->create_typed_scalar(inv_sqrt2, input);
+            if (!scale_tensor) {
+                GGML_LOG_ERROR("%s: failed to create scale constant for GELU\n", __func__);
+                return nullptr;
+            }
+
+            auto* scale_layer = network->addElementWise(
+                *input, *scale_tensor, nvinfer1::ElementWiseOperation::kPROD);
+            if (!scale_layer) {
+                GGML_LOG_ERROR("%s: failed to create scale layer for GELU\n", __func__);
+                return nullptr;
+            }
+            nvinfer1::ITensor* scaled = scale_layer->getOutput(0);
+
+            auto* erf_layer = network->addUnary(*scaled, nvinfer1::UnaryOperation::kERF);
+            if (!erf_layer) {
+                GGML_LOG_ERROR("%s: failed to create ERF layer for GELU\n", __func__);
+                return nullptr;
+            }
+            nvinfer1::ITensor* erf_out = erf_layer->getOutput(0);
+
+            nvinfer1::ITensor* one_tensor = builder->create_typed_scalar(1.0f, input);
+            if (!one_tensor) {
+                GGML_LOG_ERROR("%s: failed to create one constant for GELU\n", __func__);
+                return nullptr;
+            }
+
+            auto* add_layer = network->addElementWise(
+                *erf_out, *one_tensor, nvinfer1::ElementWiseOperation::kSUM);
+            if (!add_layer) {
+                GGML_LOG_ERROR("%s: failed to create add layer for GELU\n", __func__);
+                return nullptr;
+            }
+            nvinfer1::ITensor* one_plus_erf = add_layer->getOutput(0);
+
+            nvinfer1::ITensor* half_tensor = builder->create_typed_scalar(0.5f, input);
+            if (!half_tensor) {
+                GGML_LOG_ERROR("%s: failed to create half constant for GELU\n", __func__);
+                return nullptr;
+            }
+
+            auto* half_layer = network->addElementWise(
+                *one_plus_erf, *half_tensor, nvinfer1::ElementWiseOperation::kPROD);
+            if (!half_layer) {
+                GGML_LOG_ERROR("%s: failed to create half mul layer for GELU\n", __func__);
+                return nullptr;
+            }
+            nvinfer1::ITensor* cdf = half_layer->getOutput(0);
+
+            auto* mul_layer = network->addElementWise(
+                *input, *cdf, nvinfer1::ElementWiseOperation::kPROD);
+            if (!mul_layer) {
+                GGML_LOG_ERROR("%s: failed to create final mul layer for GELU\n", __func__);
+                return nullptr;
+            }
+            mul_layer->setName((std::string(name_prefix) + "_gelu").c_str());
+            return mul_layer->getOutput(0);
+        }
+
+        case GGML_UNARY_OP_EXP:
+        {
+            auto* layer = network->addUnary(*input, nvinfer1::UnaryOperation::kEXP);
+            if (!layer) {
+                GGML_LOG_ERROR("%s: failed to create EXP layer\n", __func__);
+                return nullptr;
+            }
+            layer->setName((std::string(name_prefix) + "_exp").c_str());
+            return layer->getOutput(0);
+        }
+
+        default:
+            GGML_LOG_ERROR("%s: unsupported activation %d\n", __func__, (int)activation);
+            return nullptr;
+    }
 }
 
 } // namespace ggml_tensorrt
