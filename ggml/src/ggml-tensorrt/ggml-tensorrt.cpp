@@ -408,9 +408,12 @@ static void collect_leaves_recursive(
 //
 // 1. Leaf outputs: non-shape nodes not consumed by any other node in the
 //    segment via src[].  These are the primary outputs.
-// 2. Diamond cases: non-shape segment nodes consumed by nodes outside the
-//    segment (via src[] of any cgraph node not in the segment).  This handles
-//    the rare case where a tensor is consumed both in-segment and externally.
+// 2. External consumers: nodes outside the segment that consume segment nodes
+//    via src[].  When the consumed node is a shape op (VIEW, RESHAPE, etc.),
+//    trace through the shape op chain to the underlying compute node — shape
+//    ops alias their source's data pointer, so the compute node is what TRT
+//    must actually write.  This also handles diamond cases where a tensor is
+//    consumed both in-segment and externally.
 // 3. Assert that all output addresses are unique — they are written
 //    simultaneously by enqueueV3, so address sharing would be a race.
 static std::unordered_set<size_t> compute_segment_outputs(
@@ -446,14 +449,23 @@ static std::unordered_set<size_t> compute_segment_outputs(
         }
     }
 
-    // Step 2: diamond cases — segment nodes consumed by external nodes
+    // Step 2: diamond cases — segment nodes consumed by external nodes.
+    // When an external consumer points to a shape op in our segment, trace
+    // through the shape op chain (VIEW → RESHAPE → ...) to find the
+    // underlying compute node — shape ops alias their source's data pointer,
+    // so the compute node must be the TRT output that writes the data.
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (trt_node_set.count(node)) continue;  // skip segment nodes
         for (int j = 0; j < GGML_MAX_SRC && node->src[j]; j++) {
             const ggml_tensor * src = node->src[j];
             if (!trt_node_set.count(src)) continue;   // not from our segment
-            if (is_shape_op(src->op)) continue;         // aliases source addr
+            // Trace through shape ops to the compute node that owns the data
+            while (is_shape_op(src->op) && src->src[0] &&
+                   trt_node_set.count(src->src[0])) {
+                src = src->src[0];
+            }
+            if (is_shape_op(src->op)) continue;         // traced outside segment
             if (bound_output_ptrs.count(src)) continue; // already marked
             auto it = node_to_ni.find(src);
             if (it != node_to_ni.end()) {
