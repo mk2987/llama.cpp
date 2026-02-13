@@ -403,6 +403,80 @@ static void collect_leaves_recursive(
     }
 }
 
+// Compute the set of segment-local indices whose outputs must be visible
+// outside the TRT engine.  Uses graph semantics instead of address heuristics:
+//
+// 1. Leaf outputs: non-shape nodes not consumed by any other node in the
+//    segment via src[].  These are the primary outputs.
+// 2. Diamond cases: non-shape segment nodes consumed by nodes outside the
+//    segment (via src[] of any cgraph node not in the segment).  This handles
+//    the rare case where a tensor is consumed both in-segment and externally.
+// 3. Assert that all output addresses are unique — they are written
+//    simultaneously by enqueueV3, so address sharing would be a race.
+static std::unordered_set<size_t> compute_segment_outputs(
+    const ggml_cgraph * cgraph,
+    const std::vector<int> & trt_node_indices,
+    const std::unordered_set<const ggml_tensor *> & trt_node_set
+) {
+    // Step 1: find non-shape segment nodes NOT consumed by any other segment node
+    std::unordered_set<const ggml_tensor *> consumed_in_segment;
+    for (int idx : trt_node_indices) {
+        const ggml_tensor * node = cgraph->nodes[idx];
+        for (int j = 0; j < GGML_MAX_SRC && node->src[j]; j++) {
+            consumed_in_segment.insert(node->src[j]);
+        }
+    }
+
+    // Build pointer → segment-local-index map for fast lookup
+    std::unordered_map<const ggml_tensor *, size_t> node_to_ni;
+    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+        node_to_ni[cgraph->nodes[trt_node_indices[ni]]] = ni;
+    }
+
+    std::unordered_set<const ggml_tensor *> bound_output_ptrs;
+    std::unordered_set<size_t> bound_output_indices;
+
+    // Leaf outputs: non-shape, not consumed within the segment
+    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+        const ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+        if (is_shape_op(node->op)) continue;
+        if (!consumed_in_segment.count(node)) {
+            bound_output_ptrs.insert(node);
+            bound_output_indices.insert(ni);
+        }
+    }
+
+    // Step 2: diamond cases — segment nodes consumed by external nodes
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (trt_node_set.count(node)) continue;  // skip segment nodes
+        for (int j = 0; j < GGML_MAX_SRC && node->src[j]; j++) {
+            const ggml_tensor * src = node->src[j];
+            if (!trt_node_set.count(src)) continue;   // not from our segment
+            if (is_shape_op(src->op)) continue;         // aliases source addr
+            if (bound_output_ptrs.count(src)) continue; // already marked
+            auto it = node_to_ni.find(src);
+            if (it != node_to_ni.end()) {
+                bound_output_ptrs.insert(src);
+                bound_output_indices.insert(it->second);
+            }
+        }
+    }
+
+    // Step 3: assert output address uniqueness — enqueueV3 writes all outputs
+    // simultaneously, so two outputs at the same GPU address would race.
+    {
+        std::unordered_set<void *> seen_addrs;
+        for (const ggml_tensor * t : bound_output_ptrs) {
+            auto [it, ok] = seen_addrs.insert(t->data);
+            GGML_ASSERT(ok && "two segment outputs share a GPU address — "
+                        "GGML allocator aliased live-out tensors");
+        }
+    }
+
+    return bound_output_indices;
+}
+
 // Helper: read first N float values from GPU tensor for debug logging.
 // Handles F32/F16/BF16 by converting to F32.  Returns up to n_vals floats.
 static std::vector<float> debug_read_tensor_head(const ggml_tensor * tensor, cudaStream_t stream, int n_vals = 4) {
@@ -494,27 +568,18 @@ static enum ggml_status execute_trt_segment(
         }
     }
 
-    // ── Deduplicate output bindings ──
+    // ── Determine which segment nodes are true outputs ──
     //
-    // GGML's allocator reuses buffer addresses for tensors with non-
-    // overlapping lifetimes (assuming sequential execution).  But TRT
-    // writes ALL outputs simultaneously via enqueueV3, so multiple outputs
-    // at the same address would race.  For each address, only the LAST
-    // writer in topological order gets an output binding.  Earlier writers
-    // are TRT-internal intermediates whose values flow through the engine's
-    // internal data path to their consumers.
-    std::unordered_map<void *, size_t> last_writer_for_addr;  // addr → index into trt_node_indices
-    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
-        ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
-        if (!is_shape_op(node->op)) {
-            last_writer_for_addr[node->data] = ni;
-        }
-    }
+    // Uses graph semantics: a non-shape node is an output if (a) no other
+    // segment node consumes it, or (b) a node outside the segment consumes
+    // it.  This replaces the old address-based "last writer per address"
+    // heuristic, which over-counted intermediates with unique addresses.
+    std::unordered_set<size_t> bound_output_set =
+        compute_segment_outputs(cgraph, trt_node_indices, trt_node_set);
 
     auto is_bound_output = [&](size_t ni, const ggml_tensor * node) -> bool {
-        if (is_shape_op(node->op)) return false;
-        auto it = last_writer_for_addr.find(node->data);
-        return it != last_writer_for_addr.end() && it->second == ni;
+        (void) node;
+        return bound_output_set.count(ni) > 0;
     };
 
     // ── Engine cache lookup ──
@@ -596,9 +661,9 @@ static enum ggml_status execute_trt_segment(
             }
         }
 
-        // Process all TRT nodes.  Only mark the last writer to each unique
-        // output address as a TRT network output.  Earlier writers to the same
-        // address are intermediates — TRT handles their values internally.
+        // Process all TRT nodes.  Only mark true segment outputs (leaf outputs
+        // and diamond-case outputs) as TRT network outputs.  All other nodes
+        // are intermediates whose values stay inside the TRT engine.
         int output_idx = 0;
         for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
             ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
@@ -705,7 +770,7 @@ static enum ggml_status execute_trt_segment(
         }
     }
 
-    // Bind output addresses — only bound outputs (last writer per address)
+    // Bind output addresses — only true segment outputs
     int n_outputs = 0;
     for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
         ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
