@@ -1171,6 +1171,44 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
             }
             return true;
         }
+        case GGML_OP_GLU:
+        {
+            // Diagnostic: confirm the scheduler is probing GLU support
+            {
+                static bool logged = false;
+                if (!logged) {
+                    enum ggml_glu_op gop = ggml_get_glu_op(op);
+                    GGML_LOG_WARN("%s: GLU probed — sub-op=%s out_type=%s src0_type=%s\n",
+                        __func__, ggml_glu_op_name(gop),
+                        ggml_type_name(op->type),
+                        op->src[0] ? ggml_type_name(op->src[0]->type) : "null");
+                    logged = true;
+                }
+            }
+            // Output must be a supported compute type
+            if (!is_supported_compute_type(op->type)) {
+                return false;
+            }
+            // All sources must be supported compute types
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                if (op->src[i] && !is_supported_compute_type(op->src[i]->type)) {
+                    return false;
+                }
+            }
+            // Only supported GLU sub-ops
+            enum ggml_glu_op gop = ggml_get_glu_op(op);
+            switch (gop) {
+                case GGML_GLU_OP_SWIGLU:
+                case GGML_GLU_OP_GEGLU:
+                case GGML_GLU_OP_GEGLU_ERF:
+                case GGML_GLU_OP_REGLU:
+                case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    return true;
+                default:
+                    return false;
+            }
+        }
         case GGML_OP_UNARY:
         {
             // Output must be a supported compute type
@@ -1193,32 +1231,6 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_EXP:
-                    return true;
-                default:
-                    return false;
-            }
-        }
-        case GGML_OP_GLU:
-        {
-            // Output must be a supported compute type
-            if (!is_supported_compute_type(op->type)) {
-                return false;
-            }
-            // All sources must be supported compute types
-            for (int i = 0; i < GGML_MAX_SRC; i++) {
-                if (op->src[i] && !is_supported_compute_type(op->src[i]->type)) {
-                    return false;
-                }
-            }
-            // Only supported GLU sub-ops
-            enum ggml_glu_op gop = ggml_get_glu_op(op);
-            switch (gop) {
-                case GGML_GLU_OP_SWIGLU:
-                case GGML_GLU_OP_GEGLU:
-                case GGML_GLU_OP_GEGLU_ERF:
-                case GGML_GLU_OP_REGLU:
-                case GGML_GLU_OP_GEGLU_QUICK:
-                case GGML_GLU_OP_SWIGLU_OAI:
                     return true;
                 default:
                     return false;
