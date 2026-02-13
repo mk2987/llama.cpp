@@ -1142,14 +1142,20 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
                     return false;
                 }
             }
-            // SOFT_MAX: reject mask and ALiBi
+            // SOFT_MAX: accept optional mask, reject ALiBi and sinks
             if (op->op == GGML_OP_SOFT_MAX) {
-                if (op->src[1] != nullptr) {
+                // Reject sinks (src[2]) — rare, not worth complexity
+                if (op->src[2] != nullptr) {
                     return false;
                 }
+                // Reject ALiBi (per-head slopes need complex constant generation)
                 float max_bias = 0.0f;
                 memcpy(&max_bias, &op->op_params[1], sizeof(float));
                 if (max_bias != 0.0f) {
+                    return false;
+                }
+                // Mask type (src[1]) must be a supported compute type
+                if (op->src[1] && !is_supported_compute_type(op->src[1]->type)) {
                     return false;
                 }
             }

@@ -17,16 +17,12 @@ nvinfer1::ITensor* handle_soft_max(NetworkBuilder* builder, const ggml_tensor* n
     const ggml_tensor* src = node->src[0];
     GGML_ASSERT(src != nullptr);
 
-    // Reject mask (src[1]) and ALiBi (max_bias != 0)
+    // Extract scale and max_bias from op_params
     float scale = 1.0f;
     float max_bias = 0.0f;
     memcpy(&scale,    &node->op_params[0], sizeof(float));
     memcpy(&max_bias, &node->op_params[1], sizeof(float));
 
-    if (node->src[1] != nullptr) {
-        GGML_LOG_ERROR("%s: masked softmax not supported\n", __func__);
-        return nullptr;
-    }
     if (max_bias != 0.0f) {
         GGML_LOG_ERROR("%s: ALiBi softmax not supported\n", __func__);
         return nullptr;
@@ -72,6 +68,27 @@ nvinfer1::ITensor* handle_soft_max(NetworkBuilder* builder, const ggml_tensor* n
         input = scale_layer->getOutput(0);
     }
 
+    // Add mask if present: input = scaled_input + mask
+    if (node->src[1] != nullptr) {
+        nvinfer1::ITensor* mask = builder->get_tensor(node->src[1]);
+        if (mask == nullptr) {
+            GGML_LOG_ERROR("%s: mask tensor not found in network\n", __func__);
+            return nullptr;
+        }
+        // Cast mask to F32 (same as scaled input)
+        mask = builder->maybe_cast(mask, nvinfer1::DataType::kFLOAT);
+        // Pad mask rank to match input rank if needed
+        mask = builder->pad_to_ndims(mask, dims.nbDims);
+
+        auto* add_layer = network->addElementWise(
+            *input, *mask, nvinfer1::ElementWiseOperation::kSUM);
+        if (add_layer == nullptr) {
+            GGML_LOG_ERROR("%s: failed to create mask add layer\n", __func__);
+            return nullptr;
+        }
+        input = add_layer->getOutput(0);
+    }
+
     // Softmax along GGML dim 0 = TRT last dim
     uint32_t softmax_axes = 1U << (dims.nbDims - 1);
 
@@ -90,8 +107,9 @@ nvinfer1::ITensor* handle_soft_max(NetworkBuilder* builder, const ggml_tensor* n
     // Cast back to original type if needed
     output = builder->maybe_cast(output, input_type);
 
-    GGML_LOG_DEBUG("%s: softmax on axes=0x%x, scale=%.4f, output shape %s\n",
+    GGML_LOG_DEBUG("%s: softmax on axes=0x%x, scale=%.4f, masked=%s, output shape %s\n",
         __func__, softmax_axes, scale,
+        node->src[1] ? "yes" : "no",
         dims_to_string(output->getDimensions()).c_str());
 
     return output;
