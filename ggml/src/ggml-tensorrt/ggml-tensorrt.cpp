@@ -494,6 +494,29 @@ static enum ggml_status execute_trt_segment(
         }
     }
 
+    // ── Deduplicate output bindings ──
+    //
+    // GGML's allocator reuses buffer addresses for tensors with non-
+    // overlapping lifetimes (assuming sequential execution).  But TRT
+    // writes ALL outputs simultaneously via enqueueV3, so multiple outputs
+    // at the same address would race.  For each address, only the LAST
+    // writer in topological order gets an output binding.  Earlier writers
+    // are TRT-internal intermediates whose values flow through the engine's
+    // internal data path to their consumers.
+    std::unordered_map<void *, size_t> last_writer_for_addr;  // addr → index into trt_node_indices
+    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+        ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+        if (!is_shape_op(node->op)) {
+            last_writer_for_addr[node->data] = ni;
+        }
+    }
+
+    auto is_bound_output = [&](size_t ni, const ggml_tensor * node) -> bool {
+        if (is_shape_op(node->op)) return false;
+        auto it = last_writer_for_addr.find(node->data);
+        return it != last_writer_for_addr.end() && it->second == ni;
+    };
+
     // ── Engine cache lookup ──
 
     uint64_t hash = compute_graph_hash(cgraph, trt_node_indices);
@@ -573,10 +596,12 @@ static enum ggml_status execute_trt_segment(
             }
         }
 
-        // Process all TRT nodes — only mark compute ops (non-shape) as outputs
+        // Process all TRT nodes.  Only mark the last writer to each unique
+        // output address as a TRT network output.  Earlier writers to the same
+        // address are intermediates — TRT handles their values internally.
         int output_idx = 0;
-        for (int idx : trt_node_indices) {
-            ggml_tensor * node = cgraph->nodes[idx];
+        for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+            ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
 
             nvinfer1::ITensor* output = net_builder.add_operation(node);
             if (!output) {
@@ -585,7 +610,7 @@ static enum ggml_status execute_trt_segment(
                 return GGML_STATUS_FAILED;
             }
 
-            if (!is_shape_op(node->op)) {
+            if (is_bound_output(ni, node)) {
                 nvinfer1::DataType expected_type = ggml_type_to_tensorrt(node->type);
                 output = net_builder.maybe_cast(output, expected_type);
 
@@ -643,9 +668,9 @@ static enum ggml_status execute_trt_segment(
 
     // ── I/O aliasing guard ──
     std::unordered_set<void *> output_addrs;
-    for (int idx : trt_node_indices) {
-        ggml_tensor * node = cgraph->nodes[idx];
-        if (!is_shape_op(node->op)) {
+    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+        ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+        if (is_bound_output(ni, node)) {
             output_addrs.insert(node->data);
         }
     }
@@ -680,13 +705,11 @@ static enum ggml_status execute_trt_segment(
         }
     }
 
-    // Bind output addresses — only compute ops (skip shape ops)
+    // Bind output addresses — only bound outputs (last writer per address)
     int n_outputs = 0;
-    for (int idx : trt_node_indices) {
-        ggml_tensor * node = cgraph->nodes[idx];
-        if (is_shape_op(node->op)) {
-            continue;
-        }
+    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+        ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+        if (!is_bound_output(ni, node)) continue;
         char name[64];
         snprintf(name, sizeof(name), "output_%d", n_outputs);
         if (!exec_ctx->setTensorAddress(name, node->data)) {
@@ -745,9 +768,9 @@ static enum ggml_status execute_trt_segment(
     if (debug_enabled) {
         CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
         int out_idx = 0;
-        for (int idx : trt_node_indices) {
-            ggml_tensor * node = cgraph->nodes[idx];
-            if (is_shape_op(node->op)) continue;
+        for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+            ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+            if (!is_bound_output(ni, node)) continue;
             auto vals = debug_read_tensor_head(node, ctx->stream);
             fprintf(stderr, "[TRT-DEBUG]   output_%d: addr=%p, type=%s, shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]",
                 out_idx, node->data, ggml_type_name(node->type),
