@@ -474,6 +474,26 @@ static enum ggml_status execute_trt_segment(
         return GGML_STATUS_SUCCESS;
     }
 
+    // Check if segment has any compute (non-shape) ops.  A segment of only
+    // shape ops (VIEW, RESHAPE, PERMUTE, TRANSPOSE) produces no TRT network
+    // outputs and is a no-op — the data pointers already alias the correct
+    // memory.  This happens after SET_ROWS when the next nodes are VIEWs of
+    // the KV cache before the graph transitions to another backend (ROPE).
+    {
+        bool has_compute_op = false;
+        for (int idx : trt_node_indices) {
+            if (!is_shape_op(cgraph->nodes[idx]->op)) {
+                has_compute_op = true;
+                break;
+            }
+        }
+        if (!has_compute_op) {
+            GGML_LOG_DEBUG("%s: segment %" PRId64 " has only shape ops (%zu nodes), skipping\n",
+                __func__, segment_id, trt_node_indices.size());
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+
     // ── Engine cache lookup ──
 
     uint64_t hash = compute_graph_hash(cgraph, trt_node_indices);
