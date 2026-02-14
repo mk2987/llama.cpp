@@ -8,12 +8,6 @@
 #include <map>
 #include <vector>
 
-// 64-bit golden ratio constant: 2^64 / phi, where phi = (1 + sqrt(5)) / 2.
-// Multiplying sequential integers by this spreads them across the full 64-bit
-// range with minimal collision.  Standard Fibonacci hashing constant from
-// Knuth (TAOCP Vol. 3) — also used in boost::hash_combine and similar.
-#define GGML_TENSORRT_HASH_GOLDEN_RATIO 0x9e3779b97f4a7c15ULL
-
 namespace ggml_tensorrt {
 
 // Configuration for engine building

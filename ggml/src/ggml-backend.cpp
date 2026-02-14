@@ -1283,6 +1283,81 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->n_splits = i_split + 1;
     }
 
+    // pass 6: mark cross-split outputs
+    //
+    // A tensor consumed by a node in a different split must survive until
+    // that split executes.  The GGML_TENSOR_FLAG_SUBGRAPH_OUTPUT flag lets
+    // backends (e.g. TensorRT-RTX) identify these tensors structurally
+    // rather than relying on runtime data-pointer addresses.
+    //
+    // Two cases:
+    //   (a) Cross-backend: pass 5 replaces consumer src[j] with a copy, so
+    //       walking src[j] no longer finds the original producer.  Use
+    //       split->inputs[] which stores the original source tensors.
+    //   (b) Same-backend: src[j] is NOT replaced, so walking src[j] works.
+    //       Use a hash-based node→split lookup to detect cross-split sources.
+    {
+        // Clear old flags (handles re-entrant calls from pipeline copies)
+        for (int i = 0; i < graph->n_nodes; i++) {
+            graph->nodes[i]->flags &= ~GGML_TENSOR_FLAG_SUBGRAPH_OUTPUT;
+        }
+
+        // Case (a): mark split inputs (cross-backend cross-split outputs).
+        // split->inputs[k] is the original source tensor before copy replacement.
+        for (int s = 0; s < sched->n_splits; s++) {
+            for (int k = 0; k < sched->splits[s].n_inputs; k++) {
+                struct ggml_tensor * inp = sched->splits[s].inputs[k];
+                inp->flags |= GGML_TENSOR_FLAG_SUBGRAPH_OUTPUT;
+            }
+        }
+
+        // Case (b): same-backend cross-split outputs via node→split lookup.
+        int * hv_tensor_split_ids = (int *) calloc(sched->hash_set.size, sizeof(int));
+        if (hv_tensor_split_ids) {
+            // Initialize to -1 (not in any split)
+            for (size_t j = 0; j < sched->hash_set.size; j++) {
+                hv_tensor_split_ids[j] = -1;
+            }
+
+            // Map each node to its split
+            for (int s = 0; s < sched->n_splits; s++) {
+                for (int i = sched->splits[s].i_start; i < sched->splits[s].i_end; i++) {
+                    size_t id = hash_id(graph->nodes[i]);
+                    hv_tensor_split_ids[id] = s;
+                }
+            }
+
+            // For each node, check if any source is from a different split
+            for (int s = 0; s < sched->n_splits; s++) {
+                for (int i = sched->splits[s].i_start; i < sched->splits[s].i_end; i++) {
+                    struct ggml_tensor * node = graph->nodes[i];
+                    if (ggml_is_view_op(node->op)) {
+                        continue;
+                    }
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        struct ggml_tensor * src = node->src[j];
+                        if (src == NULL) {
+                            continue;
+                        }
+                        size_t src_id = ggml_hash_find(&sched->hash_set, src);
+                        if (src_id == GGML_HASHSET_FULL) {
+                            continue;  // src not in hash set
+                        }
+                        if (!ggml_bitset_get(sched->hash_set.used, src_id)) {
+                            continue;  // src not in hash set
+                        }
+                        int src_split = hv_tensor_split_ids[src_id];
+                        if (src_split != -1 && src_split != s) {
+                            src->flags |= GGML_TENSOR_FLAG_SUBGRAPH_OUTPUT;
+                        }
+                    }
+                }
+            }
+
+            free(hv_tensor_split_ids);
+        }
+    }
+
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
     }

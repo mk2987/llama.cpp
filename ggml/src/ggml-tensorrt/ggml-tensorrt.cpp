@@ -355,6 +355,22 @@ static bool is_trt_compatible(const ggml_tensor * node) {
     return NetworkBuilder::is_operation_supported(node->op);
 }
 
+// Walk through shape ops (VIEW, RESHAPE, PERMUTE, TRANSPOSE) to find the
+// originating compute node that owns the data.  Shape ops share data
+// pointers with src[0], so consumers of shape ops are really consumers of
+// the root compute node.
+static const ggml_tensor * find_data_root(const ggml_tensor * t) {
+    while (t && is_shape_op(t->op) && t->src[0]) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+// Consumer map: compute node → list of consumer node indices in the subgraph.
+// Shape ops are transparent — their consumers register against the root compute
+// node that owns the data (via find_data_root).
+using consumer_map_t = std::unordered_map<const ggml_tensor *, std::vector<int>>;
+
 // Recursively collect true leaf inputs, walking through shape op chains.
 // Shape ops (VIEW, RESHAPE, PERMUTE, TRANSPOSE) pass through to their src[0].
 // GGML_OP_NONE tensors are leaves.  Tensors produced by other TRT nodes in the
@@ -449,6 +465,7 @@ static enum ggml_status execute_trt_segment(
     const ggml_cgraph * cgraph,
     const std::vector<int> & trt_node_indices,
     const std::unordered_set<const ggml_tensor *> & trt_node_set,
+    const consumer_map_t & consumers,
     bool debug_enabled,
     int64_t segment_id
 ) {
@@ -498,43 +515,38 @@ static enum ggml_status execute_trt_segment(
         }
     }
 
-    // ── Deduplicate output bindings ──
+    // ── Determine segment outputs ──
     //
-    // GGML's allocator reuses buffer addresses for tensors with non-
-    // overlapping lifetimes (assuming sequential execution).  But TRT
-    // writes ALL outputs simultaneously via enqueueV3, so multiple outputs
-    // at the same address would race.  For each address, only the LAST
-    // writer in topological order gets an output binding.  Earlier writers
-    // are TRT-internal intermediates whose values flow through the engine's
-    // internal data path to their consumers.
-    std::unordered_map<void *, size_t> last_writer_for_addr;  // addr → index into trt_node_indices
-    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
-        ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
-        if (!is_shape_op(node->op)) {
-            last_writer_for_addr[node->data] = ni;
-        }
-    }
-
-    auto is_bound_output = [&](size_t ni, const ggml_tensor * node) -> bool {
+    // A non-shape node is a segment output if:
+    //   1. GGML_TENSOR_FLAG_SUBGRAPH_OUTPUT — consumed by another scheduler
+    //      split (cross-subgraph output, set by the scheduler), OR
+    //   2. Any consumer in the subgraph is NOT in this TRT segment — i.e.
+    //      the node is consumed by a trivial op (SET_ROWS) or a node in
+    //      another segment (inter-segment output).
+    //
+    // This is purely structural (address-independent), so all transformer
+    // layers with identical graph structure produce the same output set →
+    // one cached engine shared across layers.
+    auto is_segment_output = [&](const ggml_tensor * node) -> bool {
         if (is_shape_op(node->op)) return false;
-        auto it = last_writer_for_addr.find(node->data);
-        return it != last_writer_for_addr.end() && it->second == ni;
+        // Cross-subgraph: scheduler flag
+        if (node->flags & GGML_TENSOR_FLAG_SUBGRAPH_OUTPUT) return true;
+        // Inter-segment: check if any consumer is outside this TRT segment
+        auto it = consumers.find(node);
+        if (it == consumers.end()) return true;  // no known consumers → must be an output
+        for (int ci : it->second) {
+            if (!trt_node_set.count(cgraph->nodes[ci])) return true;
+        }
+        return false;
     };
 
     // ── Engine cache lookup ──
     //
     // The graph hash covers ops, shapes, and types but NOT data addresses.
-    // Different layers share identical graph structure yet the GGML allocator
-    // assigns different addresses, causing last_writer_for_addr to produce
-    // different output configurations (count and position).  Mix the output
-    // pattern into the hash so different configurations get distinct engines.
+    // Output detection is now address-independent (flag + consumer analysis),
+    // so the hash is purely structural — no output pattern mixing needed.
 
     uint64_t hash = compute_graph_hash(cgraph, trt_node_indices);
-    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
-        if (is_bound_output(ni, cgraph->nodes[trt_node_indices[ni]])) {
-            hash ^= (ni + 1) * GGML_TENSORRT_HASH_GOLDEN_RATIO;
-        }
-    }
 
     nvinfer1::ICudaEngine* engine = ctx->engine_mgr->get_cached_engine(hash);
 
@@ -615,9 +627,9 @@ static enum ggml_status execute_trt_segment(
             }
         }
 
-        // Process all TRT nodes.  Only mark the last writer to each unique
-        // output address as a TRT network output.  Earlier writers to the same
-        // address are intermediates — TRT handles their values internally.
+        // Process all TRT nodes.  Nodes identified as segment outputs (via
+        // scheduler flag or consumer analysis) become TRT network outputs.
+        // All other nodes are TRT-internal intermediates.
         int output_idx = 0;
         for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
             ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
@@ -629,7 +641,7 @@ static enum ggml_status execute_trt_segment(
                 return GGML_STATUS_FAILED;
             }
 
-            if (is_bound_output(ni, node)) {
+            if (is_segment_output(node)) {
                 nvinfer1::DataType expected_type = ggml_type_to_tensorrt(node->type);
                 output = net_builder.maybe_cast(output, expected_type);
 
@@ -709,7 +721,7 @@ static enum ggml_status execute_trt_segment(
     std::unordered_set<void *> output_addrs;
     for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
         ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
-        if (is_bound_output(ni, node)) {
+        if (is_segment_output(node)) {
             output_addrs.insert(node->data);
         }
     }
@@ -744,11 +756,11 @@ static enum ggml_status execute_trt_segment(
         }
     }
 
-    // Bind output addresses — only bound outputs (last writer per address)
+    // Bind output addresses — only segment outputs (flag + consumer analysis)
     int n_outputs = 0;
     for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
         ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
-        if (!is_bound_output(ni, node)) continue;
+        if (!is_segment_output(node)) continue;
         char name[64];
         snprintf(name, sizeof(name), "output_%d", n_outputs);
         if (!exec_ctx->setTensorAddress(name, node->data)) {
@@ -809,7 +821,7 @@ static enum ggml_status execute_trt_segment(
         int out_idx = 0;
         for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
             ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
-            if (!is_bound_output(ni, node)) continue;
+            if (!is_segment_output(node)) continue;
             auto vals = debug_read_tensor_head(node, ctx->stream);
             fprintf(stderr, "[TRT-DEBUG]   output_%d: addr=%p, type=%s, shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]",
                 out_idx, node->data, ggml_type_name(node->type),
@@ -854,6 +866,24 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
     // Reset scratch buffer (shared across all segments this call)
     ctx->scratch.reset();
 
+    // ── Build consumer map ──
+    //
+    // For each non-shape-op node, find its true consumers by walking through
+    // transparent shape ops.  This map is shared across all segments and is
+    // used by execute_trt_segment to determine which nodes are inter-segment
+    // outputs (consumed by SET_ROWS or nodes in a different segment).
+    consumer_map_t consumers;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (is_shape_op(node->op)) continue;
+        for (int j = 0; j < GGML_MAX_SRC && node->src[j]; j++) {
+            const ggml_tensor * root = find_data_root(node->src[j]);
+            if (root) {
+                consumers[root].push_back(i);
+            }
+        }
+    }
+
     // ── Segmented execution ──
     //
     // Walk nodes in topological order.  Consecutive TRT-compatible nodes
@@ -875,7 +905,7 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
     auto flush_segment = [&]() -> ggml_status {
         if (!seg_trt_indices.empty()) {
             ggml_status status = execute_trt_segment(
-                ctx, cgraph, seg_trt_indices, seg_trt_set,
+                ctx, cgraph, seg_trt_indices, seg_trt_set, consumers,
                 debug_enabled, call_id * 100 + segment_id);
             if (status != GGML_STATUS_SUCCESS) return status;
             segment_id++;
