@@ -40,11 +40,31 @@ private:
 // created in the same process.
 Logger & get_global_logger();
 
-// Scratch buffer for I/O aliasing workaround.
-// When a TRT output binding and a leaf input binding share the same device
-// address (GGML allocator reuse), we copy the leaf to scratch before
-// enqueueV3 so TRT sees distinct addresses.  Bump allocator, reset per
-// graph_compute call, persists across calls (grows once, stays).
+// Scratch buffer for the I/O aliasing guard.
+//
+// WHY THIS EXISTS:
+// GGML's memory allocator reuses buffer addresses for tensors with
+// non-overlapping lifetimes, assuming sequential node execution.  But
+// TensorRT's enqueueV3() executes ALL bound inputs and outputs in a
+// single fused kernel launch — effectively "simultaneously".  If a leaf
+// input and a segment output are bound to the same device address, TRT
+// reads the input and writes the output at the same address concurrently,
+// producing garbage (the write clobbers the input before it's fully read).
+//
+// THE FIX:
+// Before enqueueV3, we detect any leaf input whose address collides with
+// a segment output address.  For each collision, we copy the leaf data to
+// a scratch region so TRT reads from scratch (safe) while writing to the
+// original address (no conflict).
+//
+// IMPLEMENTATION:
+// Bump allocator — alloc() advances an offset within a single cudaMalloc'd
+// buffer.  reset() rewinds the offset to zero (reclaims space).  The buffer
+// grows dynamically (cudaFree + cudaMalloc) when capacity is exceeded.
+// IMPORTANT: callers must not hold pointers across multiple alloc() calls
+// because a growth can invalidate all prior pointers.  The I/O aliasing
+// guard pre-computes total scratch needed and does ONE alloc() call to
+// avoid this.  Reset happens per segment in flush_segment().
 struct scratch_buffer {
     void * ptr      = nullptr;
     size_t capacity = 0;

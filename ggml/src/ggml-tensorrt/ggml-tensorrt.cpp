@@ -718,6 +718,26 @@ static enum ggml_status execute_trt_segment(
     }
 
     // ── I/O aliasing guard ──
+    //
+    // WHY: GGML's allocator reuses device addresses for tensors whose
+    // lifetimes don't overlap when executed sequentially.  TRT's enqueueV3()
+    // reads all inputs and writes all outputs in one fused launch — effectively
+    // simultaneously.  If a leaf input and a segment output share an address,
+    // TRT writes the output while still reading the input at that address →
+    // read/write race → garbage.  We detect these collisions and copy the
+    // affected leaf inputs to scratch memory so TRT sees distinct addresses.
+    //
+    // HOW: Collect all output addresses, then check each leaf.  Aliased
+    // leaves are copied to scratch via cudaMemcpyAsync before enqueueV3.
+    //
+    // CRITICAL: Pre-compute the total scratch needed and do ONE alloc() call.
+    // The scratch_buffer is a bump allocator with dynamic growth — when it
+    // grows, it cudaFree()s the old buffer and cudaMalloc()s a new one.
+    // If we call alloc() per leaf, a growth in the Nth call frees the buffer
+    // that previous alloc() results point into → use-after-free.  A single
+    // alloc() for the total ensures at most one realloc, and all sub-offsets
+    // remain valid within the same buffer.
+
     std::unordered_set<void *> output_addrs;
     for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
         ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
@@ -726,12 +746,28 @@ static enum ggml_status execute_trt_segment(
         }
     }
 
+    // Pre-compute total scratch needed for all I/O aliases
+    size_t total_scratch = 0;
+    for (size_t k = 0; k < leaf_tensors.size(); k++) {
+        if (output_addrs.count(leaf_tensors[k]->data)) {
+            size_t nbytes = ggml_nbytes(leaf_tensors[k]);
+            total_scratch += (nbytes + 255) & ~255;  // match alloc() alignment
+        }
+    }
+
+    void * scratch_base = nullptr;
+    if (total_scratch > 0) {
+        scratch_base = ctx->scratch.alloc(total_scratch);
+    }
+
+    size_t scratch_off = 0;
     std::vector<void *> leaf_bind_addrs(leaf_tensors.size());
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
         void * addr = leaf_tensors[k]->data;
         if (output_addrs.count(addr)) {
             size_t nbytes = ggml_nbytes(leaf_tensors[k]);
-            void * scratch_addr = ctx->scratch.alloc(nbytes);
+            void * scratch_addr = (char *)scratch_base + scratch_off;
+            scratch_off += (nbytes + 255) & ~255;
             CUDA_CHECK(cudaMemcpyAsync(scratch_addr, addr, nbytes,
                                        cudaMemcpyDeviceToDevice, ctx->stream));
             leaf_bind_addrs[k] = scratch_addr;
@@ -921,6 +957,7 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         seg_trt_indices.clear();
         seg_trt_set.clear();
         pending_trivial.clear();
+        ctx->scratch.reset();  // reclaim scratch for next segment
         return GGML_STATUS_SUCCESS;
     };
 
