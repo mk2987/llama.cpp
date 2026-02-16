@@ -87,6 +87,14 @@ target_link_libraries(ggml-tensorrt PRIVATE
     CUDA::cuda_driver
 )
 
+# Same-GPU multi-backend: link against ggml-cuda when available so that
+# TRT can return CUDA's buffer type, enabling the scheduler to freely
+# route ops between TRT and CUDA on the same physical GPU.
+if (TARGET ggml-cuda)
+    target_link_libraries(ggml-tensorrt PRIVATE ggml-cuda)
+    target_compile_definitions(ggml-tensorrt PRIVATE GGML_USE_CUDA)
+endif()
+
 # Add compile definitions
 target_compile_definitions(ggml-tensorrt PRIVATE
     GGML_USE_TENSORRT

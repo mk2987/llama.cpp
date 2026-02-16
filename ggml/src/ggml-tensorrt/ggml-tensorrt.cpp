@@ -6,6 +6,9 @@
 #include "ggml-tensorrt.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <cuda_runtime.h>
 #include <NvInfer.h>
@@ -1177,7 +1180,28 @@ static ggml_backend_t ggml_backend_tensorrt_device_init(ggml_backend_dev_t dev, 
     return ggml_backend_tensorrt_init(device_index);
 }
 
+// Get the companion CUDA backend's default buffer type for the same CUDA device.
+// Both TRT and CUDA use the same CUDA device index, so we call directly into the
+// CUDA backend's public API.  Returns nullptr if CUDA backend is not available.
+static ggml_backend_buffer_type_t find_cuda_buft_for_device(ggml_backend_dev_t dev) {
+    int device_index = (int)(intptr_t)dev->context;
+#ifdef GGML_USE_CUDA
+    return ggml_backend_cuda_buffer_type(device_index);
+#else
+    (void) device_index;
+    return nullptr;
+#endif
+}
+
 static ggml_backend_buffer_type_t ggml_backend_tensorrt_device_get_buffer_type(ggml_backend_dev_t dev) {
+    // Prefer companion CUDA buffer type (same physical GPU).
+    // This makes sched->bufts[trt] == sched->bufts[cuda], enabling
+    // the scheduler to freely route ops between TRT and CUDA.
+    ggml_backend_buffer_type_t cuda_buft = find_cuda_buft_for_device(dev);
+    if (cuda_buft) {
+        return cuda_buft;
+    }
+    // Standalone mode (no CUDA backend)
     int device_index = (int)(intptr_t)dev->context;
     return ggml_backend_tensorrt_buffer_type(device_index);
 }
@@ -1198,11 +1222,10 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
     (void) dev;
 
     // Metadata and data-movement ops — no type restriction, handled outside TRT engine.
-    // CPY/DUP/CONT/SET_ROWS must be claimed because KV cache tensors live in TRT
-    // buffers (TRT registers first as GPU backend).  Without claiming these ops,
-    // the scheduler aborts: no backend supports the op on TRT buffer memory.
+    // CPY/DUP/CONT/SET_ROWS must be claimed so that the scheduler can assign them
+    // to TRT when the tensors are on GPU memory (CUDA or TRT buffers).
     // These ops are NOT built into TRT engines — they run as trivial CUDA ops
-    // in graph_compute Phase 1b.
+    // (SET_ROWS) or are absorbed into TRT graphs (CPY/DUP/CONT) in graph_compute.
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_VIEW:
@@ -1379,8 +1402,6 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
 }
 
 static bool ggml_backend_tensorrt_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    (void) dev;
-
     // Accept own device buffer types
     if (buft->iface.get_name == ggml_backend_tensorrt_buffer_type_get_name) {
         return true;
@@ -1393,6 +1414,14 @@ static bool ggml_backend_tensorrt_device_supports_buft(ggml_backend_dev_t dev, g
 
     // Accept any host buffer type (enables scheduler copy path)
     if (ggml_backend_buft_is_host(buft)) {
+        return true;
+    }
+
+    // Accept device buffers from companion backends on the same physical GPU.
+    // Both TRT and CUDA allocate via cudaMalloc on the same device,
+    // so device pointers are interchangeable.
+    ggml_backend_buffer_type_t cuda_buft = find_cuda_buft_for_device(dev);
+    if (cuda_buft && buft == cuda_buft) {
         return true;
     }
 
