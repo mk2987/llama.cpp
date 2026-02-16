@@ -37,8 +37,22 @@ nvinfer1::ITensor* handle_get_rows(NetworkBuilder* builder, const ggml_tensor* n
     // Gather axis: GGML gathers along ne[1] (rows).
     // ggml_tensor_to_dims reverses dimension order, so GGML ne[1] maps to
     // TRT dimension (nbDims - 2) for the data tensor.
+    //
+    // 1D edge case: ggml_n_dims strips trailing size-1 dims, so a tensor
+    // with shape [ne0, 1, 1, 1] becomes 1D [ne0] in TRT.  GGML ne[1]=1
+    // means there's only one "row" — reshape to [1, ne0] so the gather
+    // axis (0) selects that single row.
+    nvinfer1::Dims data_dims = trt_data->getDimensions();
+    if (data_dims.nbDims < 2) {
+        nvinfer1::Dims reshape_dims;
+        reshape_dims.nbDims = 2;
+        reshape_dims.d[0] = 1;
+        reshape_dims.d[1] = data_dims.d[0];
+        auto* shuffle = network->addShuffle(*trt_data);
+        shuffle->setReshapeDimensions(reshape_dims);
+        trt_data = shuffle->getOutput(0);
+    }
     int gather_axis = trt_data->getDimensions().nbDims - 2;
-    GGML_ASSERT(gather_axis >= 0);
 
     auto* gather_layer = network->addGather(*trt_data, *trt_indices, gather_axis);
     if (gather_layer == nullptr) {
