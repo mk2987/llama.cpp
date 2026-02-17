@@ -741,11 +741,18 @@ static enum ggml_status execute_trt_segment(
                     p.opt_dims = actual;
                     p.max_dims = actual;
                     p.min_dims.d[0] = 1;
-                    // Max must be large enough for typical prompts but not so
-                    // large that TRT's worst-case memory planning OOMs.
-                    // 512 covers most prompts; actual*4 handles larger ones.
+                    // Max: large enough for typical prompts, but capped to
+                    // prevent TRT from planning worst-case memory for absurd
+                    // sizes (e.g. n_vocab=262K at dim 0 from GET_ROWS output).
+                    // Cap at 4096 — covers all realistic prompt lengths.
+                    // If actual > 4096, use actual (engine still works at
+                    // the current size, just can't grow beyond it).
                     int64_t expanded = actual.d[0] * 4;
-                    p.max_dims.d[0] = expanded > 512 ? expanded : 512;
+                    if (expanded < 512) expanded = 512;
+                    if (expanded > 4096) expanded = 4096;
+                    // Never set max below actual (profile violation)
+                    if (expanded < actual.d[0]) expanded = actual.d[0];
+                    p.max_dims.d[0] = expanded;
                 }
                 profiles.push_back(p);
             }
