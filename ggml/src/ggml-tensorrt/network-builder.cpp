@@ -384,30 +384,12 @@ nvinfer1::ITensor* NetworkBuilder::pad_to_ndims(
         return tensor;
     }
 
-    nvinfer1::Dims new_dims;
-    new_dims.nbDims = target_ndims;
     int pad = target_ndims - current.nbDims;
-    for (int i = 0; i < pad; i++) {
-        new_dims.d[i] = 1;
-    }
-    // When padding adds leading 1-dims, the output position pad+i corresponds
-    // to input position i.  TRT's special value 0 copies from the SAME position
-    // in the input, not offset by pad.  So we use -1 (infer) for one dynamic
-    // dim, which is correct when there's at most one dynamic dim.
-    bool used_infer = false;
+
+    // Check if any dim is dynamic (-1)
+    bool has_dynamic = false;
     for (int i = 0; i < current.nbDims; i++) {
-        if (current.d[i] == -1) {
-            if (!used_infer) {
-                new_dims.d[pad + i] = -1;
-                used_infer = true;
-            } else {
-                // Multiple dynamic dims — fall back to concrete value from current.
-                // This shouldn't happen for typical pad_to_ndims usage.
-                new_dims.d[pad + i] = current.d[i];
-            }
-        } else {
-            new_dims.d[pad + i] = current.d[i];
-        }
+        if (current.d[i] == -1) { has_dynamic = true; break; }
     }
 
     auto* shuffle = network_->addShuffle(*tensor);
@@ -415,7 +397,65 @@ nvinfer1::ITensor* NetworkBuilder::pad_to_ndims(
         GGML_LOG_ERROR("%s: failed to add shuffle layer for rank padding\n", __func__);
         return nullptr;
     }
-    shuffle->setReshapeDimensions(new_dims);
+
+    if (!has_dynamic) {
+        // All static: use concrete reshape dims
+        nvinfer1::Dims new_dims;
+        new_dims.nbDims = target_ndims;
+        for (int i = 0; i < pad; i++) {
+            new_dims.d[i] = 1;
+        }
+        for (int i = 0; i < current.nbDims; i++) {
+            new_dims.d[pad + i] = current.d[i];
+        }
+        shuffle->setReshapeDimensions(new_dims);
+    } else {
+        // Dynamic dims: build a shape tensor [1, ..., 1, d0, d1, ...]
+        // by prepending 1s to the input's runtime shape via IShapeLayer.
+        // setReshapeDimensions can't handle multiple -1 wildcards, but
+        // setInput(1, shape_tensor) accepts fully dynamic shapes.
+
+        auto* shape_layer = network_->addShape(*tensor);
+        if (shape_layer == nullptr) {
+            GGML_LOG_ERROR("%s: failed to create shape layer for pad_to_ndims\n", __func__);
+            return nullptr;
+        }
+        nvinfer1::ITensor* shape_tensor = shape_layer->getOutput(0);
+        nvinfer1::DataType shape_type = shape_tensor->getType();
+
+        // Create padding constant: [1, 1, ..., 1] with `pad` elements
+        nvinfer1::Dims pad_dims{1, {pad}};
+        nvinfer1::Weights pad_weights{shape_type, nullptr, static_cast<int64_t>(pad)};
+        if (shape_type == nvinfer1::DataType::kINT64) {
+            weight_storage_.emplace_back(pad * sizeof(int64_t));
+            auto* data = reinterpret_cast<int64_t*>(weight_storage_.back().data());
+            for (int i = 0; i < pad; i++) data[i] = 1;
+        } else {
+            weight_storage_.emplace_back(pad * sizeof(int32_t));
+            auto* data = reinterpret_cast<int32_t*>(weight_storage_.back().data());
+            for (int i = 0; i < pad; i++) data[i] = 1;
+        }
+        pad_weights.values = weight_storage_.back().data();
+
+        auto* pad_const = network_->addConstant(pad_dims, pad_weights);
+        if (pad_const == nullptr) {
+            GGML_LOG_ERROR("%s: failed to create padding constant\n", __func__);
+            return nullptr;
+        }
+
+        // Concatenate: [1,...,1] ++ [d0, d1, ...] → [1,...,1, d0, d1, ...]
+        nvinfer1::ITensor* concat_inputs[] = {pad_const->getOutput(0), shape_tensor};
+        auto* concat = network_->addConcatenation(concat_inputs, 2);
+        if (concat == nullptr) {
+            GGML_LOG_ERROR("%s: failed to concatenate pad + shape\n", __func__);
+            return nullptr;
+        }
+        concat->setAxis(0);
+
+        // Use the shape tensor as the reshape target
+        shuffle->setInput(1, *concat->getOutput(0));
+    }
+
     return shuffle->getOutput(0);
 }
 
