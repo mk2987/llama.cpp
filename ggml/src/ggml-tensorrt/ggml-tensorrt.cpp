@@ -717,24 +717,6 @@ static enum ggml_status execute_trt_segment(
             engine_config.max_aux_streams = atoi(aux_streams_env);
         }
 
-        // Check if there's enough free VRAM to attempt the build.
-        // Building with insufficient memory can leak CUDA resources and
-        // cause cascading failures for subsequent builds.
-        {
-            size_t free_bytes = 0, total_bytes = 0;
-            cudaMemGetInfo(&free_bytes, &total_bytes);
-            GGML_LOG_WARN("%s: building engine (segment %" PRId64 ", hash 0x%016" PRIx64 ", %zu nodes, workspace %zu MB, GPU free %zu MB / %zu MB)\n",
-                __func__, segment_id, hash, trt_node_indices.size(),
-                engine_config.max_workspace_size >> 20, free_bytes >> 20, total_bytes >> 20);
-
-            if (free_bytes < min_workspace) {
-                GGML_LOG_ERROR("%s: insufficient free VRAM for engine build "
-                    "(%zu MB free, need at least %zu MB workspace)\n",
-                    __func__, free_bytes >> 20, min_workspace >> 20);
-                return GGML_STATUS_FAILED;
-            }
-        }
-
         // Build optimization profiles for dynamic inputs
         std::vector<input_profile> profiles;
         if (has_dynamic_inputs) {
@@ -769,13 +751,37 @@ static enum ggml_status execute_trt_segment(
             }
         }
 
+        // Diagnostic: log build details and VRAM state
+        {
+            size_t free_bytes = 0, total_bytes = 0;
+            cudaMemGetInfo(&free_bytes, &total_bytes);
+            int64_t max_dim0 = 0;
+            for (const auto & p : profiles) {
+                if (p.max_dims.d[0] > max_dim0) {
+                    max_dim0 = p.max_dims.d[0];
+                }
+            }
+            GGML_LOG_ERROR("%s: building engine (segment %" PRId64 ", hash 0x%016" PRIx64
+                ", %zu nodes, %zu leaves [%zu static, %zu dynamic], "
+                "workspace %zu MB, GPU free %zu MB / %zu MB, "
+                "dynamic=%s, profile_max_dim0=%" PRId64 ")\n",
+                __func__, segment_id, hash, trt_node_indices.size(), leaf_tensors.size(),
+                static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size(),
+                engine_config.max_workspace_size >> 20, free_bytes >> 20, total_bytes >> 20,
+                has_dynamic_inputs ? "yes" : "no", max_dim0);
+        }
+
         if (has_dynamic_inputs) {
             engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config, profiles);
         } else {
             engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config);
         }
         if (!engine) {
-            GGML_LOG_ERROR("%s: failed to build TensorRT engine\n", __func__);
+            size_t free_after = 0, total_after = 0;
+            cudaMemGetInfo(&free_after, &total_after);
+            GGML_LOG_ERROR("%s: failed to build TensorRT engine "
+                "(segment %" PRId64 ", GPU free %zu MB / %zu MB after failed build)\n",
+                __func__, segment_id, free_after >> 20, total_after >> 20);
             return GGML_STATUS_FAILED;
         }
 
