@@ -583,8 +583,16 @@ static enum ggml_status execute_trt_segment(
 
     bool was_cache_miss = (engine == nullptr);
 
-    // ── Cache miss — build engine ──
+    // ── Build engine (cache miss or profile overflow rebuild) ──
+    //
+    // The loop runs at most twice: once for the normal path (cache hit or
+    // initial build), and once more if the cached engine's profile range
+    // is too narrow for the current input shapes.
 
+    bool enable_cuda_graphs = !has_dynamic_inputs;
+    nvinfer1::IExecutionContext* exec_ctx = nullptr;
+
+    for (int build_attempt = 0; build_attempt < 2; build_attempt++) {
     if (engine == nullptr) {
         // Diagnostic dump: log the subgraph structure before building
         static const bool dump_graph = (getenv("GGML_TENSORRT_DUMP_GRAPH") != nullptr &&
@@ -733,16 +741,17 @@ static enum ggml_status execute_trt_segment(
         // generous ranges for regular transformer layers (weight dims ~6K)
         // and tight ranges for the logits segment (weight dim = n_vocab).
 
-        // Find the largest dimension across all static (weight) leaves.
-        // This approximates the "cost factor" per unit of dynamic dim growth.
+        // Find the largest dimension across ALL leaves (weights, activations,
+        // caches).  This approximates the "cost factor" per unit of dynamic
+        // dim growth — the intermediate memory for a matmul with a large
+        // weight scales as max_leaf_dim × max_dynamic_dim0 × sizeof(float).
+        // Scanning all leaves (not just static) ensures the cap remains
+        // correct even after a rebuild that reclassifies all inputs as dynamic.
         int64_t max_weight_dim = 1;
-        if (has_dynamic_inputs) {
-            for (const auto* leaf : leaf_tensors) {
-                if (!static_leaf_set.count(leaf)) continue;
-                for (int d = 0; d < GGML_MAX_DIMS; d++) {
-                    if (leaf->ne[d] > (int64_t)max_weight_dim) {
-                        max_weight_dim = leaf->ne[d];
-                    }
+        for (const auto* leaf : leaf_tensors) {
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                if (leaf->ne[d] > (int64_t)max_weight_dim) {
+                    max_weight_dim = leaf->ne[d];
                 }
             }
         }
@@ -827,32 +836,81 @@ static enum ggml_status execute_trt_segment(
         }
 
         ctx->engine_mgr->cache_engine(hash, engine);
-    }
+    } // end if (engine == nullptr)
 
-    // ── Execute ──
-
-    // Disable CUDA graphs for dynamic-shape engines — shape changes break replay
-    bool enable_cuda_graphs = !has_dynamic_inputs;
-    nvinfer1::IExecutionContext* exec_ctx = ctx->engine_mgr->get_or_create_context(hash, enable_cuda_graphs);
+    // Create context and set input shapes
+    exec_ctx = ctx->engine_mgr->get_or_create_context(hash, enable_cuda_graphs);
     if (!exec_ctx) {
         GGML_LOG_ERROR("%s: failed to get execution context\n", __func__);
         return GGML_STATUS_FAILED;
     }
 
-    // Set actual input shapes for all inputs (required before enqueueV3
-    // when using optimization profiles — TRT needs concrete shapes for both
-    // static and dynamic inputs in the profile).
+    // Set actual input shapes (required before enqueueV3 with profiles).
+    // If setInputShape fails, the cached engine's profile range is too
+    // narrow.  Evict the stale engine and let the loop retry with a
+    // rebuild that uses the current (larger) actual shapes.
+    bool shapes_ok = true;
     if (has_dynamic_inputs) {
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
             char name[64];
             snprintf(name, sizeof(name), "input_%zu", k);
             nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
             if (!exec_ctx->setInputShape(name, actual)) {
-                GGML_LOG_ERROR("%s: failed to set input shape for %s\n", __func__, name);
-                return GGML_STATUS_FAILED;
+                shapes_ok = false;
+                break;
             }
         }
     }
+    if (shapes_ok) {
+        break;  // shapes accepted, proceed to execution
+    }
+    // Shape mismatch — either a dynamic input exceeded its profile range,
+    // or a "static" input's shape changed (e.g. KV cache heads that are
+    // F16 op=NONE without FLAG_INPUT but grow with context length).
+    //
+    // Surgically reclassify: compare each static leaf's current dims with
+    // what the engine expects.  Any mismatch means that leaf's shape varies
+    // at runtime → move it to the dynamic set.  This avoids making large
+    // weight tensors (vocab embedding, 262K) dynamic, which would OOM.
+    //
+    // After reclassification, recompute the hash so the rebuilt engine is
+    // stored under the correct key.  Future calls with the same structure
+    // but different seq_len will still misclassify these leaves as static,
+    // producing a different "original" hash → cache miss → rebuild →
+    // same reclassification → same "corrected" hash → cache hit on the
+    // rebuilt engine.  Net cost: one rebuild per unique seq_len, then hits.
+    {
+        nvinfer1::ICudaEngine* stale = ctx->engine_mgr->get_cached_engine(hash);
+        if (stale) {
+            for (size_t k = 0; k < leaf_tensors.size(); k++) {
+                if (!static_leaf_set.count(leaf_tensors[k])) continue;
+                char name[64];
+                snprintf(name, sizeof(name), "input_%zu", k);
+                nvinfer1::Dims engine_dims = stale->getTensorShape(name);
+                nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
+                bool match = (engine_dims.nbDims == actual.nbDims);
+                for (int d = 0; d < engine_dims.nbDims && match; d++) {
+                    if (engine_dims.d[d] != -1 && engine_dims.d[d] != actual.d[d]) {
+                        match = false;
+                    }
+                }
+                if (!match) {
+                    static_leaf_set.erase(leaf_tensors[k]);
+                    has_dynamic_inputs = true;
+                    enable_cuda_graphs = false;
+                }
+            }
+        }
+    }
+    GGML_LOG_DEBUG("%s: shape mismatch for segment %" PRId64
+        ", rebuilding (%zu static, %zu dynamic)\n", __func__, segment_id,
+        static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size());
+    ctx->engine_mgr->evict_engine(hash);
+    // Recompute hash with reclassified leaves so the rebuilt engine is
+    // stored under a key that reflects the corrected static/dynamic split
+    hash = compute_graph_hash(cgraph, trt_node_indices, static_leaf_set);
+    engine = nullptr;
+    } // end build/retry loop
 
     // ── I/O aliasing guard ──
     //

@@ -4,6 +4,7 @@
 #include <NvInfer.h>
 #include <NvInferRuntime.h>
 #include <chrono>
+#include <cinttypes>
 
 namespace ggml_tensorrt {
 
@@ -364,6 +365,14 @@ void EngineManager::cache_engine(uint64_t hash, nvinfer1::ICudaEngine* engine) {
 
     GGML_LOG_DEBUG("%s: cached engine with hash %llu\n", __func__,
                   static_cast<unsigned long long>(hash));
+}
+
+void EngineManager::evict_engine(uint64_t hash) {
+    // Context must be destroyed before engine (it references the engine)
+    context_cache_.erase(hash);
+    engine_cache_.erase(hash);
+    GGML_LOG_DEBUG("%s: evicted engine and context for hash 0x%016" PRIx64 "\n",
+        __func__, hash);
 }
 
 nvinfer1::IExecutionContext* EngineManager::get_or_create_context(uint64_t hash, bool use_cuda_graphs) {

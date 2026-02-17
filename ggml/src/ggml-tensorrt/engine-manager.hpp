@@ -92,6 +92,11 @@ public:
     // Cache an engine with a hash key (transfers ownership)
     void cache_engine(uint64_t hash, nvinfer1::ICudaEngine* engine);
 
+    // Evict a cached engine and its execution context.
+    // Used when the cached engine's optimization profile can no longer
+    // accommodate the current input shapes (profile range exceeded).
+    void evict_engine(uint64_t hash);
+
     // Get or create an execution context for a cached engine.
     // Returns a reusable context — caller must rebind tensor addresses before use.
     // use_cuda_graphs overrides the instance-level setting for this specific context.
