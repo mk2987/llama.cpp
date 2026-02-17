@@ -747,15 +747,15 @@ static enum ggml_status execute_trt_segment(
                     p.opt_dims = actual;
                     p.max_dims = actual;
                 } else {
-                    // Dynamic: min=1 for all dims, opt=actual, max=max(actual*4, 2048)
+                    // Dynamic: only dim 0 (token/batch) varies.
+                    // Feature dims are architecturally fixed — varying them
+                    // would violate matmul shape constraints (K must match).
                     p.min_dims = actual;
                     p.opt_dims = actual;
                     p.max_dims = actual;
-                    for (int d = 0; d < actual.nbDims; d++) {
-                        p.min_dims.d[d] = 1;
-                        int64_t expanded = actual.d[d] * 4;
-                        p.max_dims.d[d] = expanded > 2048 ? expanded : 2048;
-                    }
+                    p.min_dims.d[0] = 1;
+                    int64_t expanded = actual.d[0] * 4;
+                    p.max_dims.d[0] = expanded > 2048 ? expanded : 2048;
                 }
                 profiles.push_back(p);
             }

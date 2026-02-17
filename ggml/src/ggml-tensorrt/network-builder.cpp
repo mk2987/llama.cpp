@@ -81,12 +81,13 @@ nvinfer1::ITensor* NetworkBuilder::add_input(const ggml_tensor* tensor, const st
 
     nvinfer1::Dims dims;
     if (is_dynamic) {
-        // Dynamic input: use -1 for all dims (TRT wildcard)
-        // ndims must still match the tensor's rank
+        // Dynamic input: only the token/batch dimension (dim 0 in TRT,
+        // which is the outermost GGML dim) is truly dynamic.  Feature
+        // dims (hidden_dim, n_heads, head_dim) are architecturally fixed.
+        // Setting all dims to -1 would violate matmul shape constraints
+        // when the profile max != the weight's fixed inner dimension.
         dims = ggml_tensor_to_dims(tensor);
-        for (int i = 0; i < dims.nbDims; i++) {
-            dims.d[i] = -1;
-        }
+        dims.d[0] = -1;  // only token/batch dim is dynamic
     } else {
         // Static input: concrete dims
         dims = ggml_tensor_to_dims(tensor);
