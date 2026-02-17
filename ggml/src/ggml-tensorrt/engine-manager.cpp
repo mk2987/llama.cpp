@@ -125,8 +125,14 @@ uint64_t compute_graph_hash(
         if (n_dims == 0) n_dims = 1;
         hash = fnv1a_hash_value(hash, n_dims);
 
-        // Hash op_params (always — these are structural, not batch-dependent)
-        hash = fnv1a_hash_bytes(hash, node->op_params, sizeof(node->op_params));
+        // Hash op_params — but skip for VIEW ops whose params contain
+        // byte offsets and strides that change per layer and per token
+        // (each layer's KV cache VIEW has a different offset).  The
+        // structural properties of a VIEW (output shape, source shape)
+        // are already captured by the ndims/type hashing above.
+        if (node->op != GGML_OP_VIEW) {
+            hash = fnv1a_hash_bytes(hash, node->op_params, sizeof(node->op_params));
+        }
 
         // Hash source tensor types and shapes
         for (int j = 0; j < GGML_MAX_SRC; j++) {
