@@ -718,6 +718,40 @@ static enum ggml_status execute_trt_segment(
         }
 
         // Build optimization profiles for dynamic inputs
+        //
+        // The key constraint: TRT's builder allocates intermediate buffers at
+        // the MAX profile dimensions during tactic profiling.  For segments
+        // containing a MUL_MAT with large weight matrices (e.g. n_vocab=262K),
+        // the intermediate size is approximately:
+        //   max_weight_dim × max_dynamic_dim0 × sizeof(float)
+        //
+        // We scale max_dynamic_dim0 inversely with the largest weight dimension
+        // so this product stays within a memory budget.  This naturally gives
+        // generous ranges for regular transformer layers (weight dims ~6K)
+        // and tight ranges for the logits segment (weight dim = n_vocab).
+
+        // Find the largest dimension across all static (weight) leaves.
+        // This approximates the "cost factor" per unit of dynamic dim growth.
+        int64_t max_weight_dim = 1;
+        if (has_dynamic_inputs) {
+            for (const auto* leaf : leaf_tensors) {
+                if (!static_leaf_set.count(leaf)) continue;
+                for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                    if (leaf->ne[d] > (int64_t)max_weight_dim) {
+                        max_weight_dim = leaf->ne[d];
+                    }
+                }
+            }
+        }
+
+        // Budget: cap the estimated largest intermediate tensor during build.
+        // With ~10 live intermediates in a 29-node segment, 128 MB each keeps
+        // total builder memory around 1-2 GB — well within typical free VRAM.
+        const int64_t build_budget_bytes = 128LL * 1024 * 1024;
+        int64_t dim0_cap = build_budget_bytes / (max_weight_dim * (int64_t)sizeof(float));
+        if (dim0_cap < 4) dim0_cap = 4;
+        if (dim0_cap > 4096) dim0_cap = 4096;
+
         std::vector<input_profile> profiles;
         if (has_dynamic_inputs) {
             for (size_t k = 0; k < leaf_tensors.size(); k++) {
@@ -741,15 +775,9 @@ static enum ggml_status execute_trt_segment(
                     p.opt_dims = actual;
                     p.max_dims = actual;
                     p.min_dims.d[0] = 1;
-                    // Max: large enough for typical prompts, but capped to
-                    // prevent TRT from planning worst-case memory for absurd
-                    // sizes (e.g. n_vocab=262K at dim 0 from GET_ROWS output).
-                    // Cap at 4096 — covers all realistic prompt lengths.
-                    // If actual > 4096, use actual (engine still works at
-                    // the current size, just can't grow beyond it).
                     int64_t expanded = actual.d[0] * 4;
-                    if (expanded < 512) expanded = 512;
-                    if (expanded > 4096) expanded = 4096;
+                    if (expanded < 16) expanded = 16;
+                    if (expanded > dim0_cap) expanded = dim0_cap;
                     // Never set max below actual (profile violation)
                     if (expanded < actual.d[0]) expanded = actual.d[0];
                     p.max_dims.d[0] = expanded;
@@ -762,20 +790,23 @@ static enum ggml_status execute_trt_segment(
         {
             size_t free_bytes = 0, total_bytes = 0;
             cudaMemGetInfo(&free_bytes, &total_bytes);
-            int64_t max_dim0 = 0;
-            for (const auto & p : profiles) {
-                if (p.max_dims.d[0] > max_dim0) {
-                    max_dim0 = p.max_dims.d[0];
+            int64_t max_dyn_dim0 = 0;
+            for (size_t k = 0; k < profiles.size(); k++) {
+                if (k < leaf_tensors.size() && !static_leaf_set.count(leaf_tensors[k])) {
+                    if (profiles[k].max_dims.d[0] > max_dyn_dim0) {
+                        max_dyn_dim0 = profiles[k].max_dims.d[0];
+                    }
                 }
             }
             GGML_LOG_ERROR("%s: building engine (segment %" PRId64 ", hash 0x%016" PRIx64
                 ", %zu nodes, %zu leaves [%zu static, %zu dynamic], "
                 "workspace %zu MB, GPU free %zu MB / %zu MB, "
-                "dynamic=%s, profile_max_dim0=%" PRId64 ")\n",
+                "dynamic=%s, dim0_cap=%" PRId64 ", max_weight_dim=%" PRId64
+                ", max_dyn_dim0=%" PRId64 ")\n",
                 __func__, segment_id, hash, trt_node_indices.size(), leaf_tensors.size(),
                 static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size(),
                 engine_config.max_workspace_size >> 20, free_bytes >> 20, total_bytes >> 20,
-                has_dynamic_inputs ? "yes" : "no", max_dim0);
+                has_dynamic_inputs ? "yes" : "no", dim0_cap, max_weight_dim, max_dyn_dim0);
         }
 
         if (has_dynamic_inputs) {
