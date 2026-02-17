@@ -486,10 +486,38 @@ nvinfer1::Dims NetworkBuilder::make_dynamic_reshape_dims(
     // If ranks differ, the batch dim (first) usually stays at position 0.
 
     if (input_dims.nbDims == target_dims.nbDims) {
-        // Same rank: copy-through for matching positions with -1
+        // Same rank: check whether any static dim changed.  If so, the
+        // reshape redistributes elements between dynamic and static dims
+        // (e.g. [N, 1024] → [4*N, 256]).  Using 0 (copy from input) for
+        // the dynamic dim would give [N, 256] — wrong volume.  Use -1
+        // (infer from total) so TRT computes the correct dynamic value.
+        bool static_dims_changed = false;
         for (int i = 0; i < input_dims.nbDims; i++) {
-            if (input_dims.d[i] == -1) {
-                target_dims.d[i] = 0;  // copy from input at this position
+            if (input_dims.d[i] != -1 && input_dims.d[i] != target_dims.d[i]) {
+                static_dims_changed = true;
+                break;
+            }
+        }
+        if (!static_dims_changed) {
+            // All static dims match — dynamic dims are unchanged, use 0
+            for (int i = 0; i < input_dims.nbDims; i++) {
+                if (input_dims.d[i] == -1) {
+                    target_dims.d[i] = 0;  // copy from input at this position
+                }
+            }
+        } else {
+            // Static dims changed — use -1 (infer) for exactly one dynamic
+            // dim so TRT computes the compensating value at runtime
+            bool used_infer = false;
+            for (int i = 0; i < input_dims.nbDims; i++) {
+                if (input_dims.d[i] == -1) {
+                    if (!used_infer) {
+                        target_dims.d[i] = -1;
+                        used_infer = true;
+                    } else {
+                        target_dims.d[i] = 0;
+                    }
+                }
             }
         }
     } else {
