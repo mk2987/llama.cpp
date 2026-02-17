@@ -522,22 +522,32 @@ nvinfer1::Dims NetworkBuilder::make_dynamic_reshape_dims(
         }
     } else {
         // Different rank (split or merge).
-        // The batch dim is always at position 0 (outermost in TRT).
-        // Use 0 at position 0 if input dim 0 is dynamic.
-        // Use -1 (infer) for any other position that can't be resolved.
-        //
-        // Count dynamic dims to decide strategy
+        // When dim 0 is dynamic, check whether the batch dim is preserved
+        // by comparing the product of static source dims (positions > 0)
+        // with the product of target dims (positions > 0).
+        //   [N, 1024] → [N, 4, 256]: src_rest=1024, tgt_rest=1024 → 0 (copy)
+        //   [N, 256]  → [N*256]:     src_rest=256,  tgt_rest=1    → -1 (infer)
         bool used_infer = false;
         if (input_dims.d[0] == -1) {
-            target_dims.d[0] = 0;  // copy batch dim from input
+            int64_t src_rest = 1;
+            for (int i = 1; i < input_dims.nbDims; i++) {
+                if (input_dims.d[i] != -1) src_rest *= input_dims.d[i];
+            }
+            int64_t tgt_rest = 1;
+            for (int i = 1; i < target_dims.nbDims; i++) {
+                tgt_rest *= target_dims.d[i];
+            }
+            if (src_rest == tgt_rest) {
+                target_dims.d[0] = 0;   // batch dim preserved
+            } else {
+                target_dims.d[0] = -1;  // batch dim changes, infer from total
+                used_infer = true;
+            }
         }
         // For remaining dynamic input dims at positions > 0, we can't
         // use 0 because the position mapping isn't 1:1.
-        // Check if any other input dim is dynamic and needs handling.
         for (int i = 1; i < input_dims.nbDims; i++) {
             if (input_dims.d[i] == -1) {
-                // Multiple dynamic dims in different-rank reshape.
-                // Use -1 (infer) for the last target dim if not already used.
                 if (!used_infer) {
                     target_dims.d[target_dims.nbDims - 1] = -1;
                     used_infer = true;
