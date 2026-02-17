@@ -13,7 +13,7 @@ namespace ggml_tensorrt {
 
 // Configuration for engine building
 struct EngineConfig {
-    size_t max_workspace_size = 256ULL << 20; // 256 MB default
+    size_t max_workspace_size = 128ULL << 20; // 128 MB default
     int32_t dla_core = -1; // -1 means no DLA
     bool use_cuda_graphs = true;    // CUDA graph capture (on by default)
     int32_t max_aux_streams = 0;    // 0 = TRT default, >0 = allow parallel streams

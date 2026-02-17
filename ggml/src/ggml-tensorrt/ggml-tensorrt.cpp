@@ -694,11 +694,16 @@ static enum ggml_status execute_trt_segment(
         if (workspace_env) {
             engine_config.max_workspace_size = (size_t)atoi(workspace_env) << 20;
         } else {
+            // TRT needs VRAM both for workspace AND for internal build
+            // allocations (serialized engine, compiler intermediates).
+            // Cap workspace at 1/8 of free VRAM to leave headroom for
+            // TRT's own allocations, which can be 256+ MB for large
+            // dynamic-shape engines (logits matmul with big vocab).
             size_t free_bytes = 0, total_bytes = 0;
             cudaMemGetInfo(&free_bytes, &total_bytes);
-            size_t quarter_free = free_bytes / 4;
-            if (quarter_free < engine_config.max_workspace_size) {
-                engine_config.max_workspace_size = quarter_free;
+            size_t eighth_free = free_bytes / 8;
+            if (eighth_free < engine_config.max_workspace_size) {
+                engine_config.max_workspace_size = eighth_free;
             }
         }
 
