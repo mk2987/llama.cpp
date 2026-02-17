@@ -18,6 +18,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -328,9 +329,16 @@ static void ggml_backend_tensorrt_synchronize(ggml_backend_t backend) {
 // attention masks, positions) are marked by llama.cpp with
 // GGML_TENSOR_FLAG_INPUT via ggml_set_input() — their shapes change with
 // batch/sequence length and must be treated as dynamic.
+// KV cache buffers (named "cache_k_l*" / "cache_v_l*") have op=NONE and
+// no FLAG_INPUT, but their shapes change when the cache is resized.
 static bool is_static_leaf(const ggml_tensor * tensor) {
-    return tensor->op == GGML_OP_NONE &&
-           !(tensor->flags & GGML_TENSOR_FLAG_INPUT);
+    if (tensor->op != GGML_OP_NONE) return false;
+    if (tensor->flags & GGML_TENSOR_FLAG_INPUT) return false;
+    if (strncmp(tensor->name, "cache_k_l", 9) == 0 ||
+        strncmp(tensor->name, "cache_v_l", 9) == 0) {
+        return false;
+    }
+    return true;
 }
 
 // Check if an op is a shape/metadata operation (zero-copy in GGML).
@@ -471,6 +479,432 @@ static std::vector<float> debug_read_tensor_head(const ggml_tensor * tensor, cud
     return result;
 }
 
+// Build optimization profiles for dynamic input shapes.
+//
+// The key constraint: TRT's builder allocates intermediate buffers at
+// the MAX profile dimensions during tactic profiling.  For segments
+// containing a MUL_MAT with large weight matrices (e.g. n_vocab=262K),
+// the intermediate size is approximately:
+//   max_weight_dim × max_dynamic_dim0 × sizeof(float)
+//
+// We scale max_dynamic_dim0 inversely with the largest weight dimension
+// so this product stays within a memory budget.  This naturally gives
+// generous ranges for regular transformer layers (weight dims ~6K)
+// and tight ranges for the logits segment (weight dim = n_vocab).
+static std::vector<input_profile> build_optimization_profiles(
+    const std::vector<const ggml_tensor *> & leaf_tensors,
+    const std::unordered_set<const ggml_tensor *> & static_leaf_set,
+    bool has_dynamic_inputs,
+    int64_t prev_dim0_max
+) {
+    std::vector<input_profile> profiles;
+    if (!has_dynamic_inputs) return profiles;
+
+    // Find the largest dimension across ALL leaves (weights, activations,
+    // caches).  This approximates the "cost factor" per unit of dynamic
+    // dim growth — the intermediate memory for a matmul with a large
+    // weight scales as max_leaf_dim × max_dynamic_dim0 × sizeof(float).
+    int64_t max_weight_dim = 1;
+    for (const auto * leaf : leaf_tensors) {
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            if (leaf->ne[d] > max_weight_dim) {
+                max_weight_dim = leaf->ne[d];
+            }
+        }
+    }
+
+    // Budget: cap the estimated largest intermediate tensor during build.
+    // With ~10 live intermediates in a 29-node segment, 128 MB each keeps
+    // total builder memory around 1-2 GB — well within typical free VRAM.
+    const int64_t build_budget_bytes = 128LL * 1024 * 1024;
+    int64_t dim0_cap = build_budget_bytes / (max_weight_dim * (int64_t)sizeof(float));
+    if (dim0_cap < 4) dim0_cap = 4;
+    if (dim0_cap > 4096) dim0_cap = 4096;
+
+    for (size_t k = 0; k < leaf_tensors.size(); k++) {
+        char name[64];
+        snprintf(name, sizeof(name), "input_%zu", k);
+        nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
+
+        input_profile p;
+        p.name = name;
+
+        if (static_leaf_set.count(leaf_tensors[k])) {
+            // Static: min = opt = max = actual
+            p.min_dims = actual;
+            p.opt_dims = actual;
+            p.max_dims = actual;
+        } else {
+            // Dynamic: only dim 0 (token/batch) varies.
+            // Feature dims are architecturally fixed — varying them
+            // would violate matmul shape constraints (K must match).
+            p.min_dims = actual;
+            p.opt_dims = actual;
+            p.max_dims = actual;
+            p.min_dims.d[0] = 1;
+
+            // Amortized doubling: on first build, use actual*4 capped by
+            // dim0_cap.  On rebuilds (prev_dim0_max > 0), double the
+            // previous max.  This gives O(log N) rebuilds as the KV cache
+            // grows, even for segments where dim0_cap is tight (e.g. the
+            // logits segment with vocab=262K weights).
+            int64_t expanded;
+            if (prev_dim0_max > 0) {
+                expanded = prev_dim0_max * 2;
+            } else {
+                expanded = actual.d[0] * 4;
+                if (expanded < 16) expanded = 16;
+                if (expanded > dim0_cap) expanded = dim0_cap;
+            }
+            // Never set max below actual (profile violation)
+            if (expanded < actual.d[0]) expanded = actual.d[0];
+            p.max_dims.d[0] = expanded;
+        }
+        profiles.push_back(p);
+    }
+    return profiles;
+}
+
+// Build a TRT engine for a segment: create builder/network, add inputs/ops,
+// set up workspace/profiles, build, and cache.  Returns the built engine
+// pointer (or nullptr on failure).
+static nvinfer1::ICudaEngine * build_trt_engine(
+    ggml_backend_tensorrt_context * ctx,
+    const ggml_cgraph * cgraph,
+    const std::vector<int> & trt_node_indices,
+    const std::vector<const ggml_tensor *> & leaf_tensors,
+    const std::unordered_set<const ggml_tensor *> & static_leaf_set,
+    bool has_dynamic_inputs,
+    const std::function<bool(const ggml_tensor *)> & is_segment_output,
+    int64_t segment_id,
+    uint64_t hash
+) {
+    // Diagnostic dump: log the subgraph structure before building
+    static const bool dump_graph = (getenv("GGML_TENSORRT_DUMP_GRAPH") != nullptr &&
+                                    atoi(getenv("GGML_TENSORRT_DUMP_GRAPH")) != 0);
+    if (dump_graph) {
+        fprintf(stderr, "[TensorRT-RTX] building TRT segment %" PRId64 " — hash 0x%016" PRIx64 ", %zu leaves, %zu nodes\n",
+            segment_id, hash, leaf_tensors.size(), trt_node_indices.size());
+
+        for (size_t k = 0; k < leaf_tensors.size(); k++) {
+            const ggml_tensor * leaf = leaf_tensors[k];
+            fprintf(stderr, "[TensorRT-RTX]   input_%zu: op=%-12s type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] name=%s\n",
+                k, ggml_op_name(leaf->op), ggml_type_name(leaf->type),
+                leaf->ne[0], leaf->ne[1], leaf->ne[2], leaf->ne[3],
+                leaf->name);
+        }
+
+        for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+            const ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+            const char * op_str = ggml_op_name(node->op);
+
+            char op_buf[64];
+            if (node->op == GGML_OP_UNARY) {
+                snprintf(op_buf, sizeof(op_buf), "UNARY(%s)",
+                    ggml_unary_op_name(ggml_get_unary_op(node)));
+                op_str = op_buf;
+            } else if (node->op == GGML_OP_GLU) {
+                snprintf(op_buf, sizeof(op_buf), "GLU(%s)",
+                    ggml_glu_op_name(ggml_get_glu_op(node)));
+                op_str = op_buf;
+            }
+
+            fprintf(stderr, "[TensorRT-RTX]   node %3zu [%3d]: %-20s -> type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]%s\n",
+                ni, trt_node_indices[ni], op_str,
+                ggml_type_name(node->type),
+                node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                is_shape_op(node->op) ? " (shape)" : "");
+
+            for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
+                const ggml_tensor * src = node->src[s];
+                fprintf(stderr, "[TensorRT-RTX]     src[%d]: op=%-12s type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] name=%s\n",
+                    s, ggml_op_name(src->op), ggml_type_name(src->type),
+                    src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                    src->name);
+            }
+        }
+    }
+
+    std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(*ctx->logger));
+    if (!builder) {
+        GGML_LOG_ERROR("%s: failed to create TensorRT builder\n", __func__);
+        return nullptr;
+    }
+
+    const uint32_t explicit_batch = 1U << static_cast<uint32_t>(
+        nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(explicit_batch));
+    if (!network) {
+        GGML_LOG_ERROR("%s: failed to create TensorRT network\n", __func__);
+        return nullptr;
+    }
+
+    NetworkBuilder net_builder(network.get(), ctx->logger);
+
+    // Add leaf tensors as inputs with positional names.
+    // Dynamic leaves get wildcard dims (-1); static leaves get concrete dims.
+    for (size_t k = 0; k < leaf_tensors.size(); k++) {
+        char name[64];
+        snprintf(name, sizeof(name), "input_%zu", k);
+        bool is_dynamic = !static_leaf_set.count(leaf_tensors[k]);
+        if (!net_builder.add_input(leaf_tensors[k], name, is_dynamic)) {
+            GGML_LOG_ERROR("%s: failed to add input tensor input_%zu\n", __func__, k);
+            return nullptr;
+        }
+    }
+
+    // Process all TRT nodes.  Nodes identified as segment outputs (via
+    // scheduler flag or consumer analysis) become TRT network outputs.
+    // All other nodes are TRT-internal intermediates.
+    int output_idx = 0;
+    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+        ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+
+        nvinfer1::ITensor * output = net_builder.add_operation(node);
+        if (!output) {
+            GGML_LOG_ERROR("%s: operation %s not supported in TRT graph\n",
+                           __func__, ggml_op_name(node->op));
+            return nullptr;
+        }
+
+        if (is_segment_output(node)) {
+            nvinfer1::DataType expected_type = ggml_type_to_tensorrt(node->type);
+            output = net_builder.maybe_cast(output, expected_type);
+
+            char out_name[64];
+            snprintf(out_name, sizeof(out_name), "output_%d", output_idx);
+            net_builder.mark_output(output, out_name);
+            output_idx++;
+        }
+    }
+
+    // Engine configuration
+    EngineConfig engine_config;
+
+    // Minimum workspace floor — TRT's optimizer crashes with the assertion
+    // "maxScratchSize > 0" if workspace is zero.  64 MB is enough for
+    // most single-layer engines and prevents cascading failures.
+    static constexpr size_t min_workspace = 64ULL << 20;  // 64 MB
+
+    const char * workspace_env = getenv("GGML_TENSORRT_WORKSPACE_MB");
+    if (workspace_env) {
+        engine_config.max_workspace_size = (size_t)atoi(workspace_env) << 20;
+    } else {
+        // Scale workspace with available VRAM: use 1/4 of free memory,
+        // clamped to [64 MB, 4 GB].  This gives large GPUs enough
+        // workspace for wide optimization profiles (e.g. logits with
+        // vocab=262K × doubled dim0) while staying conservative on
+        // small GPUs where VRAM is tight.
+        size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        engine_config.max_workspace_size = free_bytes / 4;
+        static constexpr size_t max_workspace = 4ULL << 30;  // 4 GB
+        if (engine_config.max_workspace_size > max_workspace) {
+            engine_config.max_workspace_size = max_workspace;
+        }
+    }
+
+    // Enforce minimum — never pass 0 workspace to TRT
+    if (engine_config.max_workspace_size < min_workspace) {
+        engine_config.max_workspace_size = min_workspace;
+    }
+
+    const char * aux_streams_env = getenv("GGML_TENSORRT_AUX_STREAMS");
+    if (aux_streams_env) {
+        engine_config.max_aux_streams = atoi(aux_streams_env);
+    }
+
+    // Build optimization profiles for dynamic inputs.
+    // Amortized doubling: look up the previous profile max for this hash.
+    // On first build it's 0 (use default 4× heuristic).  On rebuilds
+    // after profile overflow, it doubles the previous max.
+    int64_t prev_dim0_max = 0;
+    auto prev_it = ctx->engine_mgr->prev_profile_dim0_max.find(hash);
+    if (prev_it != ctx->engine_mgr->prev_profile_dim0_max.end()) {
+        prev_dim0_max = prev_it->second;
+    }
+    std::vector<input_profile> profiles = build_optimization_profiles(
+        leaf_tensors, static_leaf_set, has_dynamic_inputs, prev_dim0_max);
+
+    // Diagnostic: log build details and VRAM state
+    {
+        size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        int64_t max_dyn_dim0 = 0;
+        for (size_t k = 0; k < profiles.size(); k++) {
+            if (k < leaf_tensors.size() && !static_leaf_set.count(leaf_tensors[k])) {
+                if (profiles[k].max_dims.d[0] > max_dyn_dim0) {
+                    max_dyn_dim0 = profiles[k].max_dims.d[0];
+                }
+            }
+        }
+
+        // Compute dim0_cap and max_weight_dim for logging (same logic as profiles)
+        int64_t max_weight_dim = 1;
+        for (const auto * leaf : leaf_tensors) {
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                if (leaf->ne[d] > max_weight_dim) max_weight_dim = leaf->ne[d];
+            }
+        }
+        const int64_t build_budget_bytes = 128LL * 1024 * 1024;
+        int64_t dim0_cap = build_budget_bytes / (max_weight_dim * (int64_t)sizeof(float));
+        if (dim0_cap < 4) dim0_cap = 4;
+        if (dim0_cap > 4096) dim0_cap = 4096;
+
+        GGML_LOG_DEBUG("%s: building engine (segment %" PRId64 ", hash 0x%016" PRIx64
+            ", %zu nodes, %zu leaves [%zu static, %zu dynamic], "
+            "workspace %zu MB, GPU free %zu MB / %zu MB, "
+            "dynamic=%s, dim0_cap=%" PRId64 ", max_weight_dim=%" PRId64
+            ", max_dyn_dim0=%" PRId64 ")\n",
+            __func__, segment_id, hash, trt_node_indices.size(), leaf_tensors.size(),
+            static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size(),
+            engine_config.max_workspace_size >> 20, free_bytes >> 20, total_bytes >> 20,
+            has_dynamic_inputs ? "yes" : "no", dim0_cap, max_weight_dim, max_dyn_dim0);
+    }
+
+    nvinfer1::ICudaEngine * engine = nullptr;
+    if (has_dynamic_inputs) {
+        engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config, profiles);
+
+        // If the build failed (likely OOM from amortized doubling making the
+        // profile too wide), retry with profiles clamped to actual dims.
+        // This gives zero headroom (next growth will rebuild) but avoids a
+        // fatal OOM crash.
+        if (!engine) {
+            int64_t failed_max = 0;
+            for (size_t k = 0; k < profiles.size(); k++) {
+                if (k < leaf_tensors.size() && !static_leaf_set.count(leaf_tensors[k])) {
+                    if (profiles[k].max_dims.d[0] > failed_max) {
+                        failed_max = profiles[k].max_dims.d[0];
+                    }
+                }
+            }
+            GGML_LOG_WARN("%s: build OOM with profile dim0_max=%" PRId64 ", workspace=%zu MB, "
+                "retrying with actual dims (segment %" PRId64 ")\n",
+                __func__, failed_max, engine_config.max_workspace_size >> 20, segment_id);
+            for (size_t k = 0; k < profiles.size(); k++) {
+                if (k < leaf_tensors.size() && !static_leaf_set.count(leaf_tensors[k])) {
+                    nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
+                    profiles[k].max_dims.d[0] = actual.d[0];
+                }
+            }
+            // Need fresh builder/network since TRT may have corrupted state.
+            // Destroy network BEFORE builder (network references builder internals).
+            network.reset();
+            builder.reset(nvinfer1::createInferBuilder(*ctx->logger));
+            network.reset(builder ? builder->createNetworkV2(explicit_batch) : nullptr);
+            if (builder && network) {
+                NetworkBuilder retry_builder(network.get(), ctx->logger);
+                for (size_t k = 0; k < leaf_tensors.size(); k++) {
+                    char name[64];
+                    snprintf(name, sizeof(name), "input_%zu", k);
+                    bool is_dynamic = !static_leaf_set.count(leaf_tensors[k]);
+                    retry_builder.add_input(leaf_tensors[k], name, is_dynamic);
+                }
+                int retry_out_idx = 0;
+                for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+                    ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+                    nvinfer1::ITensor * output = retry_builder.add_operation(node);
+                    if (output && is_segment_output(node)) {
+                        nvinfer1::DataType expected_type = ggml_type_to_tensorrt(node->type);
+                        output = retry_builder.maybe_cast(output, expected_type);
+                        char out_name[64];
+                        snprintf(out_name, sizeof(out_name), "output_%d", retry_out_idx);
+                        retry_builder.mark_output(output, out_name);
+                        retry_out_idx++;
+                    }
+                }
+                engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config, profiles);
+            }
+        }
+    } else {
+        engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config);
+    }
+    if (!engine) {
+        size_t free_after = 0, total_after = 0;
+        cudaMemGetInfo(&free_after, &total_after);
+        GGML_LOG_ERROR("%s: failed to build TensorRT engine "
+            "(segment %" PRId64 ", GPU free %zu MB / %zu MB after failed build)\n",
+            __func__, segment_id, free_after >> 20, total_after >> 20);
+        return nullptr;
+    }
+
+    ctx->engine_mgr->cache_engine(hash, engine);
+
+    // Record the profile dim0 max for amortized doubling on future rebuilds
+    if (has_dynamic_inputs) {
+        int64_t max_dim0 = 0;
+        for (size_t k = 0; k < profiles.size(); k++) {
+            if (k < leaf_tensors.size() && !static_leaf_set.count(leaf_tensors[k])) {
+                if (profiles[k].max_dims.d[0] > max_dim0) {
+                    max_dim0 = profiles[k].max_dims.d[0];
+                }
+            }
+        }
+        ctx->engine_mgr->prev_profile_dim0_max[hash] = max_dim0;
+    }
+
+    return engine;
+}
+
+// Check whether a cached engine can accept the current leaf shapes.
+// Returns true if a rebuild is needed.
+//
+// Two cases require a rebuild:
+//   1. Static mismatch: a leaf classified as static has a shape that
+//      differs from the engine's baked-in dims.  The leaf is reclassified
+//      as dynamic (erased from static_leaf_set) so the rebuilt engine
+//      uses an optimization profile for it.
+//   2. Profile overflow: a dynamic leaf's actual dim exceeds the engine's
+//      optimization profile max.  No reclassification needed — the rebuilt
+//      engine will have a wider profile based on the current actual dims.
+static bool reclassify_mismatched_leaves(
+    ggml_backend_tensorrt_context * ctx,
+    uint64_t hash,
+    const std::vector<const ggml_tensor *> & leaf_tensors,
+    std::unordered_set<const ggml_tensor *> & static_leaf_set,
+    bool & has_dynamic_inputs,
+    bool & enable_cuda_graphs
+) {
+    nvinfer1::ICudaEngine * engine = ctx->engine_mgr->get_cached_engine(hash);
+    if (!engine) return false;
+
+    bool needs_rebuild = false;
+    for (size_t k = 0; k < leaf_tensors.size(); k++) {
+        char name[64];
+        snprintf(name, sizeof(name), "input_%zu", k);
+        nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
+
+        if (static_leaf_set.count(leaf_tensors[k])) {
+            // Static leaf: compare actual dims against engine's baked-in dims
+            nvinfer1::Dims engine_dims = engine->getTensorShape(name);
+            bool match = (engine_dims.nbDims == actual.nbDims);
+            for (int d = 0; d < engine_dims.nbDims && match; d++) {
+                if (engine_dims.d[d] != -1 && engine_dims.d[d] != actual.d[d]) {
+                    match = false;
+                }
+            }
+            if (!match) {
+                static_leaf_set.erase(leaf_tensors[k]);
+                has_dynamic_inputs = true;
+                enable_cuda_graphs = false;
+                needs_rebuild = true;
+            }
+        } else {
+            // Dynamic leaf: check if actual dims fit within profile range
+            nvinfer1::Dims max_dims = engine->getProfileShape(name, 0,
+                nvinfer1::OptProfileSelector::kMAX);
+            for (int d = 0; d < actual.nbDims && d < max_dims.nbDims; d++) {
+                if (actual.d[d] > max_dims.d[d]) {
+                    needs_rebuild = true;
+                    break;
+                }
+            }
+        }
+    }
+    return needs_rebuild;
+}
+
 // Execute one TRT segment: collect leaves → hash → build/cache engine →
 // I/O alias guard → bind inputs/outputs → enqueueV3 → debug logging.
 // Each segment is a contiguous run of TRT-compatible nodes between trivial
@@ -579,338 +1013,67 @@ static enum ggml_status execute_trt_segment(
 
     uint64_t hash = compute_graph_hash(cgraph, trt_node_indices, static_leaf_set);
 
-    nvinfer1::ICudaEngine* engine = ctx->engine_mgr->get_cached_engine(hash);
+    nvinfer1::ICudaEngine * engine = ctx->engine_mgr->get_cached_engine(hash);
 
     bool was_cache_miss = (engine == nullptr);
 
-    // ── Build engine (cache miss or profile overflow rebuild) ──
+    // ── Validate cached engine against current shapes ──
     //
-    // The loop runs at most twice: once for the normal path (cache hit or
-    // initial build), and once more if the cached engine's profile range
-    // is too narrow for the current input shapes.
-
+    // Before calling setInputShape, check whether the cached engine can
+    // accept the current leaf shapes.  Two problems are detected:
+    //   1. Static mismatch: a leaf classified as static has a shape that
+    //      differs from the engine's baked-in dims (e.g. KV cache data
+    //      misclassified as a weight).  Reclassify it as dynamic.
+    //   2. Profile overflow: a dynamic leaf's actual dim exceeds the
+    //      engine's optimization profile max.
+    // Both cases evict the stale engine and rebuild before TRT ever
+    // sees the incompatible shapes — no TRT ERROR messages.
     bool enable_cuda_graphs = !has_dynamic_inputs;
-    nvinfer1::IExecutionContext* exec_ctx = nullptr;
+    if (engine != nullptr) {
+        bool needs_rebuild = reclassify_mismatched_leaves(
+            ctx, hash, leaf_tensors, static_leaf_set,
+            has_dynamic_inputs, enable_cuda_graphs);
+        if (needs_rebuild) {
+            GGML_LOG_WARN("%s: shape/profile mismatch for segment %" PRId64
+                ", rebuilding (%zu static, %zu dynamic)\n", __func__, segment_id,
+                static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size());
+            ctx->engine_mgr->evict_engine(hash);
+            hash = compute_graph_hash(cgraph, trt_node_indices, static_leaf_set);
+            engine = ctx->engine_mgr->get_cached_engine(hash);
+            enable_cuda_graphs = !has_dynamic_inputs;
+        }
+    }
 
-    for (int build_attempt = 0; build_attempt < 2; build_attempt++) {
+    // ── Build engine (cache miss or post-reclassification) ──
     if (engine == nullptr) {
-        // Diagnostic dump: log the subgraph structure before building
-        static const bool dump_graph = (getenv("GGML_TENSORRT_DUMP_GRAPH") != nullptr &&
-                                        atoi(getenv("GGML_TENSORRT_DUMP_GRAPH")) != 0);
-        if (dump_graph) {
-            fprintf(stderr, "[TensorRT-RTX] building TRT segment %" PRId64 " — hash 0x%016" PRIx64 ", %zu leaves, %zu nodes\n",
-                segment_id, hash, leaf_tensors.size(), trt_node_indices.size());
-
-            for (size_t k = 0; k < leaf_tensors.size(); k++) {
-                const ggml_tensor * leaf = leaf_tensors[k];
-                fprintf(stderr, "[TensorRT-RTX]   input_%zu: op=%-12s type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] name=%s\n",
-                    k, ggml_op_name(leaf->op), ggml_type_name(leaf->type),
-                    leaf->ne[0], leaf->ne[1], leaf->ne[2], leaf->ne[3],
-                    leaf->name);
-            }
-
-            for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
-                const ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
-                const char * op_str = ggml_op_name(node->op);
-
-                char op_buf[64];
-                if (node->op == GGML_OP_UNARY) {
-                    snprintf(op_buf, sizeof(op_buf), "UNARY(%s)",
-                        ggml_unary_op_name(ggml_get_unary_op(node)));
-                    op_str = op_buf;
-                } else if (node->op == GGML_OP_GLU) {
-                    snprintf(op_buf, sizeof(op_buf), "GLU(%s)",
-                        ggml_glu_op_name(ggml_get_glu_op(node)));
-                    op_str = op_buf;
-                }
-
-                fprintf(stderr, "[TensorRT-RTX]   node %3zu [%3d]: %-20s -> type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]%s\n",
-                    ni, trt_node_indices[ni], op_str,
-                    ggml_type_name(node->type),
-                    node->ne[0], node->ne[1], node->ne[2], node->ne[3],
-                    is_shape_op(node->op) ? " (shape)" : "");
-
-                for (int s = 0; s < GGML_MAX_SRC && node->src[s]; s++) {
-                    const ggml_tensor * src = node->src[s];
-                    fprintf(stderr, "[TensorRT-RTX]     src[%d]: op=%-12s type=%-4s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] name=%s\n",
-                        s, ggml_op_name(src->op), ggml_type_name(src->type),
-                        src->ne[0], src->ne[1], src->ne[2], src->ne[3],
-                        src->name);
-                }
-            }
-        }
-
-        std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(*ctx->logger));
-        if (!builder) {
-            GGML_LOG_ERROR("%s: failed to create TensorRT builder\n", __func__);
-            return GGML_STATUS_FAILED;
-        }
-
-        const uint32_t explicit_batch = 1U << static_cast<uint32_t>(
-            nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
-        std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(explicit_batch));
-        if (!network) {
-            GGML_LOG_ERROR("%s: failed to create TensorRT network\n", __func__);
-            return GGML_STATUS_FAILED;
-        }
-
-        NetworkBuilder net_builder(network.get(), ctx->logger);
-
-        // Add leaf tensors as inputs with positional names.
-        // Dynamic leaves get wildcard dims (-1); static leaves get concrete dims.
-        for (size_t k = 0; k < leaf_tensors.size(); k++) {
-            char name[64];
-            snprintf(name, sizeof(name), "input_%zu", k);
-            bool is_dynamic = !static_leaf_set.count(leaf_tensors[k]);
-            if (!net_builder.add_input(leaf_tensors[k], name, is_dynamic)) {
-                GGML_LOG_ERROR("%s: failed to add input tensor input_%zu\n", __func__, k);
-                return GGML_STATUS_FAILED;
-            }
-        }
-
-        // Process all TRT nodes.  Nodes identified as segment outputs (via
-        // scheduler flag or consumer analysis) become TRT network outputs.
-        // All other nodes are TRT-internal intermediates.
-        int output_idx = 0;
-        for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
-            ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
-
-            nvinfer1::ITensor* output = net_builder.add_operation(node);
-            if (!output) {
-                GGML_LOG_ERROR("%s: operation %s not supported in TRT graph\n",
-                               __func__, ggml_op_name(node->op));
-                return GGML_STATUS_FAILED;
-            }
-
-            if (is_segment_output(node)) {
-                nvinfer1::DataType expected_type = ggml_type_to_tensorrt(node->type);
-                output = net_builder.maybe_cast(output, expected_type);
-
-                char out_name[64];
-                snprintf(out_name, sizeof(out_name), "output_%d", output_idx);
-                net_builder.mark_output(output, out_name);
-                output_idx++;
-            }
-        }
-
-        // Build engine
-        EngineConfig engine_config;
-
-        // Minimum workspace floor — TRT's optimizer crashes with the assertion
-        // "maxScratchSize > 0" if workspace is zero.  64 MB is enough for
-        // most single-layer engines and prevents cascading failures.
-        static constexpr size_t min_workspace = 64ULL << 20;  // 64 MB
-
-        const char* workspace_env = getenv("GGML_TENSORRT_WORKSPACE_MB");
-        if (workspace_env) {
-            engine_config.max_workspace_size = (size_t)atoi(workspace_env) << 20;
-        } else {
-            // TRT needs VRAM both for workspace AND for internal build
-            // allocations (serialized engine, compiler intermediates).
-            // Cap workspace at 1/8 of free VRAM to leave headroom for
-            // TRT's own allocations, which can be 256+ MB for large
-            // dynamic-shape engines (logits matmul with big vocab).
-            size_t free_bytes = 0, total_bytes = 0;
-            cudaMemGetInfo(&free_bytes, &total_bytes);
-            size_t eighth_free = free_bytes / 8;
-            if (eighth_free < engine_config.max_workspace_size) {
-                engine_config.max_workspace_size = eighth_free;
-            }
-        }
-
-        // Enforce minimum — never pass 0 workspace to TRT
-        if (engine_config.max_workspace_size < min_workspace) {
-            engine_config.max_workspace_size = min_workspace;
-        }
-
-        const char* aux_streams_env = getenv("GGML_TENSORRT_AUX_STREAMS");
-        if (aux_streams_env) {
-            engine_config.max_aux_streams = atoi(aux_streams_env);
-        }
-
-        // Build optimization profiles for dynamic inputs
-        //
-        // The key constraint: TRT's builder allocates intermediate buffers at
-        // the MAX profile dimensions during tactic profiling.  For segments
-        // containing a MUL_MAT with large weight matrices (e.g. n_vocab=262K),
-        // the intermediate size is approximately:
-        //   max_weight_dim × max_dynamic_dim0 × sizeof(float)
-        //
-        // We scale max_dynamic_dim0 inversely with the largest weight dimension
-        // so this product stays within a memory budget.  This naturally gives
-        // generous ranges for regular transformer layers (weight dims ~6K)
-        // and tight ranges for the logits segment (weight dim = n_vocab).
-
-        // Find the largest dimension across ALL leaves (weights, activations,
-        // caches).  This approximates the "cost factor" per unit of dynamic
-        // dim growth — the intermediate memory for a matmul with a large
-        // weight scales as max_leaf_dim × max_dynamic_dim0 × sizeof(float).
-        // Scanning all leaves (not just static) ensures the cap remains
-        // correct even after a rebuild that reclassifies all inputs as dynamic.
-        int64_t max_weight_dim = 1;
-        for (const auto* leaf : leaf_tensors) {
-            for (int d = 0; d < GGML_MAX_DIMS; d++) {
-                if (leaf->ne[d] > (int64_t)max_weight_dim) {
-                    max_weight_dim = leaf->ne[d];
-                }
-            }
-        }
-
-        // Budget: cap the estimated largest intermediate tensor during build.
-        // With ~10 live intermediates in a 29-node segment, 128 MB each keeps
-        // total builder memory around 1-2 GB — well within typical free VRAM.
-        const int64_t build_budget_bytes = 128LL * 1024 * 1024;
-        int64_t dim0_cap = build_budget_bytes / (max_weight_dim * (int64_t)sizeof(float));
-        if (dim0_cap < 4) dim0_cap = 4;
-        if (dim0_cap > 4096) dim0_cap = 4096;
-
-        std::vector<input_profile> profiles;
-        if (has_dynamic_inputs) {
-            for (size_t k = 0; k < leaf_tensors.size(); k++) {
-                char name[64];
-                snprintf(name, sizeof(name), "input_%zu", k);
-                nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
-
-                input_profile p;
-                p.name = name;
-
-                if (static_leaf_set.count(leaf_tensors[k])) {
-                    // Static: min = opt = max = actual
-                    p.min_dims = actual;
-                    p.opt_dims = actual;
-                    p.max_dims = actual;
-                } else {
-                    // Dynamic: only dim 0 (token/batch) varies.
-                    // Feature dims are architecturally fixed — varying them
-                    // would violate matmul shape constraints (K must match).
-                    p.min_dims = actual;
-                    p.opt_dims = actual;
-                    p.max_dims = actual;
-                    p.min_dims.d[0] = 1;
-                    int64_t expanded = actual.d[0] * 4;
-                    if (expanded < 16) expanded = 16;
-                    if (expanded > dim0_cap) expanded = dim0_cap;
-                    // Never set max below actual (profile violation)
-                    if (expanded < actual.d[0]) expanded = actual.d[0];
-                    p.max_dims.d[0] = expanded;
-                }
-                profiles.push_back(p);
-            }
-        }
-
-        // Diagnostic: log build details and VRAM state
-        {
-            size_t free_bytes = 0, total_bytes = 0;
-            cudaMemGetInfo(&free_bytes, &total_bytes);
-            int64_t max_dyn_dim0 = 0;
-            for (size_t k = 0; k < profiles.size(); k++) {
-                if (k < leaf_tensors.size() && !static_leaf_set.count(leaf_tensors[k])) {
-                    if (profiles[k].max_dims.d[0] > max_dyn_dim0) {
-                        max_dyn_dim0 = profiles[k].max_dims.d[0];
-                    }
-                }
-            }
-            GGML_LOG_DEBUG("%s: building engine (segment %" PRId64 ", hash 0x%016" PRIx64
-                ", %zu nodes, %zu leaves [%zu static, %zu dynamic], "
-                "workspace %zu MB, GPU free %zu MB / %zu MB, "
-                "dynamic=%s, dim0_cap=%" PRId64 ", max_weight_dim=%" PRId64
-                ", max_dyn_dim0=%" PRId64 ")\n",
-                __func__, segment_id, hash, trt_node_indices.size(), leaf_tensors.size(),
-                static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size(),
-                engine_config.max_workspace_size >> 20, free_bytes >> 20, total_bytes >> 20,
-                has_dynamic_inputs ? "yes" : "no", dim0_cap, max_weight_dim, max_dyn_dim0);
-        }
-
-        if (has_dynamic_inputs) {
-            engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config, profiles);
-        } else {
-            engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config);
-        }
+        engine = build_trt_engine(ctx, cgraph, trt_node_indices, leaf_tensors,
+                                  static_leaf_set, has_dynamic_inputs,
+                                  is_segment_output, segment_id, hash);
         if (!engine) {
-            size_t free_after = 0, total_after = 0;
-            cudaMemGetInfo(&free_after, &total_after);
-            GGML_LOG_ERROR("%s: failed to build TensorRT engine "
-                "(segment %" PRId64 ", GPU free %zu MB / %zu MB after failed build)\n",
-                __func__, segment_id, free_after >> 20, total_after >> 20);
             return GGML_STATUS_FAILED;
         }
+    }
 
-        ctx->engine_mgr->cache_engine(hash, engine);
-    } // end if (engine == nullptr)
-
-    // Create context and set input shapes
-    exec_ctx = ctx->engine_mgr->get_or_create_context(hash, enable_cuda_graphs);
+    // ── Execution context + input shapes ──
+    nvinfer1::IExecutionContext * exec_ctx = ctx->engine_mgr->get_or_create_context(hash, enable_cuda_graphs);
     if (!exec_ctx) {
         GGML_LOG_ERROR("%s: failed to get execution context\n", __func__);
         return GGML_STATUS_FAILED;
     }
 
-    // Set actual input shapes (required before enqueueV3 with profiles).
-    // If setInputShape fails, the cached engine's profile range is too
-    // narrow.  Evict the stale engine and let the loop retry with a
-    // rebuild that uses the current (larger) actual shapes.
-    bool shapes_ok = true;
     if (has_dynamic_inputs) {
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
             char name[64];
             snprintf(name, sizeof(name), "input_%zu", k);
             nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
             if (!exec_ctx->setInputShape(name, actual)) {
-                shapes_ok = false;
-                break;
+                GGML_LOG_ERROR("%s: setInputShape failed for segment %" PRId64
+                    " input_%zu (should have been caught by proactive check)\n",
+                    __func__, segment_id, k);
+                return GGML_STATUS_FAILED;
             }
         }
     }
-    if (shapes_ok) {
-        break;  // shapes accepted, proceed to execution
-    }
-    // Shape mismatch — either a dynamic input exceeded its profile range,
-    // or a "static" input's shape changed (e.g. KV cache heads that are
-    // F16 op=NONE without FLAG_INPUT but grow with context length).
-    //
-    // Surgically reclassify: compare each static leaf's current dims with
-    // what the engine expects.  Any mismatch means that leaf's shape varies
-    // at runtime → move it to the dynamic set.  This avoids making large
-    // weight tensors (vocab embedding, 262K) dynamic, which would OOM.
-    //
-    // After reclassification, recompute the hash so the rebuilt engine is
-    // stored under the correct key.  Future calls with the same structure
-    // but different seq_len will still misclassify these leaves as static,
-    // producing a different "original" hash → cache miss → rebuild →
-    // same reclassification → same "corrected" hash → cache hit on the
-    // rebuilt engine.  Net cost: one rebuild per unique seq_len, then hits.
-    {
-        nvinfer1::ICudaEngine* stale = ctx->engine_mgr->get_cached_engine(hash);
-        if (stale) {
-            for (size_t k = 0; k < leaf_tensors.size(); k++) {
-                if (!static_leaf_set.count(leaf_tensors[k])) continue;
-                char name[64];
-                snprintf(name, sizeof(name), "input_%zu", k);
-                nvinfer1::Dims engine_dims = stale->getTensorShape(name);
-                nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
-                bool match = (engine_dims.nbDims == actual.nbDims);
-                for (int d = 0; d < engine_dims.nbDims && match; d++) {
-                    if (engine_dims.d[d] != -1 && engine_dims.d[d] != actual.d[d]) {
-                        match = false;
-                    }
-                }
-                if (!match) {
-                    static_leaf_set.erase(leaf_tensors[k]);
-                    has_dynamic_inputs = true;
-                    enable_cuda_graphs = false;
-                }
-            }
-        }
-    }
-    GGML_LOG_DEBUG("%s: shape mismatch for segment %" PRId64
-        ", rebuilding (%zu static, %zu dynamic)\n", __func__, segment_id,
-        static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size());
-    ctx->engine_mgr->evict_engine(hash);
-    // Recompute hash with reclassified leaves so the rebuilt engine is
-    // stored under a key that reflects the corrected static/dynamic split
-    hash = compute_graph_hash(cgraph, trt_node_indices, static_leaf_set);
-    engine = nullptr;
-    } // end build/retry loop
 
     // ── I/O aliasing guard ──
     //
@@ -1009,9 +1172,11 @@ static enum ggml_status execute_trt_segment(
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
             const ggml_tensor * leaf = leaf_tensors[k];
             auto vals = debug_read_tensor_head(leaf, ctx->stream);
-            fprintf(stderr, "[TRT-DEBUG]   input_%zu: addr=%p, type=%s, shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]",
-                k, leaf->data, ggml_type_name(leaf->type),
-                leaf->ne[0], leaf->ne[1], leaf->ne[2], leaf->ne[3]);
+            fprintf(stderr, "[TRT-DEBUG]   input_%zu: addr=%p, op=%s, type=%s, shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] name=%s %s",
+                k, leaf->data, ggml_op_name(leaf->op), ggml_type_name(leaf->type),
+                leaf->ne[0], leaf->ne[1], leaf->ne[2], leaf->ne[3],
+                leaf->name[0] ? leaf->name : "(empty)",
+                static_leaf_set.count(leaf) ? "[STATIC]" : "[DYNAMIC]");
             if (!vals.empty()) {
                 fprintf(stderr, ", first=[");
                 for (size_t v = 0; v < vals.size(); v++) {
