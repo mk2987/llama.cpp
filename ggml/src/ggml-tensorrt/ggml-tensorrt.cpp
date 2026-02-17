@@ -754,8 +754,11 @@ static enum ggml_status execute_trt_segment(
                     p.opt_dims = actual;
                     p.max_dims = actual;
                     p.min_dims.d[0] = 1;
+                    // Max must be large enough for typical prompts but not so
+                    // large that TRT's worst-case memory planning OOMs.
+                    // 512 covers most prompts; actual*4 handles larger ones.
                     int64_t expanded = actual.d[0] * 4;
-                    p.max_dims.d[0] = expanded > 2048 ? expanded : 2048;
+                    p.max_dims.d[0] = expanded > 512 ? expanded : 512;
                 }
                 profiles.push_back(p);
             }
