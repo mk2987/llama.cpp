@@ -323,18 +323,14 @@ static void ggml_backend_tensorrt_synchronize(ggml_backend_t backend) {
 }
 
 // Classify a leaf tensor as "static" (shape doesn't change between calls).
-// Static leaves are model weights and normalization scales — they have
-// GGML_OP_NONE with F16 or BF16 type — these are model weights whose shapes
-// are fixed by architecture.  F32 op=NONE tensors include attention masks,
-// hidden states from other backends, and norm scales; the first two have
-// seq_len-dependent shapes that must NOT be fully hashed or given fixed
-// optimization profiles.  Norm scales (F32, fixed shape) are harmlessly
-// included in the dynamic set — their profiles get a wider range than
-// needed but the tensors are tiny so the overhead is negligible.
+// Static leaves are model weights and normalization scales — loaded from
+// GGUF once, shapes fixed by architecture.  Per-forward inputs (tokens,
+// attention masks, positions) are marked by llama.cpp with
+// GGML_TENSOR_FLAG_INPUT via ggml_set_input() — their shapes change with
+// batch/sequence length and must be treated as dynamic.
 static bool is_static_leaf(const ggml_tensor * tensor) {
     return tensor->op == GGML_OP_NONE &&
-           tensor->type != GGML_TYPE_I32 &&
-           tensor->type != GGML_TYPE_F32;
+           !(tensor->flags & GGML_TENSOR_FLAG_INPUT);
 }
 
 // Check if an op is a shape/metadata operation (zero-copy in GGML).
