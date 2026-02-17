@@ -24,16 +24,28 @@ nvinfer1::ITensor* handle_reshape(NetworkBuilder* builder, const ggml_tensor* no
         return nullptr;
     }
 
-    // Target dimensions from the output tensor shape
+    // Target dimensions from the output tensor shape (always concrete from GGML)
     nvinfer1::Dims target_dims = ggml_tensor_to_dims(node);
 
-    // Validate element count matches
+    // Make reshape dims safe for dynamic inputs (replace with 0/-1 as needed)
+    nvinfer1::Dims safe_dims = NetworkBuilder::make_dynamic_reshape_dims(trt_src, target_dims);
+
+    // Validate element count — skip if any dim is dynamic (0 or -1)
     nvinfer1::Dims src_dims = trt_src->getDimensions();
-    if (!is_reshape_valid(src_dims, target_dims)) {
-        GGML_LOG_ERROR("%s: reshape element count mismatch: %s -> %s\n",
-            __func__, dims_to_string(src_dims).c_str(),
-            dims_to_string(target_dims).c_str());
-        return nullptr;
+    {
+        bool all_static = true;
+        for (int i = 0; i < src_dims.nbDims; i++) {
+            if (src_dims.d[i] == -1) { all_static = false; break; }
+        }
+        for (int i = 0; i < safe_dims.nbDims; i++) {
+            if (safe_dims.d[i] <= 0) { all_static = false; break; }
+        }
+        if (all_static && !is_reshape_valid(src_dims, safe_dims)) {
+            GGML_LOG_ERROR("%s: reshape element count mismatch: %s -> %s\n",
+                __func__, dims_to_string(src_dims).c_str(),
+                dims_to_string(safe_dims).c_str());
+            return nullptr;
+        }
     }
 
     auto* network = builder->get_network();
@@ -43,7 +55,7 @@ nvinfer1::ITensor* handle_reshape(NetworkBuilder* builder, const ggml_tensor* no
         return nullptr;
     }
 
-    shuffle->setReshapeDimensions(target_dims);
+    shuffle->setReshapeDimensions(safe_dims);
 
     std::string layer_name = "reshape_" + std::to_string(reinterpret_cast<uintptr_t>(node));
     shuffle->setName(layer_name.c_str());
@@ -194,32 +206,42 @@ nvinfer1::ITensor* handle_view(NetworkBuilder* builder, const ggml_tensor* node)
         return nullptr;
     }
 
-    // Target dimensions from the VIEW output shape
+    // Target dimensions from the VIEW output shape (always concrete from GGML)
     nvinfer1::Dims target_dims = ggml_tensor_to_dims(node);
     nvinfer1::Dims src_dims = trt_src->getDimensions();
 
-    // If dims already match, just propagate
-    bool dims_match = (src_dims.nbDims == target_dims.nbDims);
+    // Make reshape dims safe for dynamic inputs
+    nvinfer1::Dims safe_dims = NetworkBuilder::make_dynamic_reshape_dims(trt_src, target_dims);
+
+    // If dims already match (accounting for 0 = copy-through), just propagate
+    bool dims_match = (src_dims.nbDims == safe_dims.nbDims);
     if (dims_match) {
+        bool all_equal = true;
         for (int i = 0; i < src_dims.nbDims; i++) {
-            if (src_dims.d[i] != target_dims.d[i]) {
-                dims_match = false;
-                break;
-            }
+            // 0 means "copy from input" — always matches
+            if (safe_dims.d[i] == 0) continue;
+            if (src_dims.d[i] != safe_dims.d[i]) { all_equal = false; break; }
+        }
+        if (all_equal) {
+            return trt_src;
         }
     }
-    if (dims_match) {
-        return trt_src;
-    }
 
-    // Validate element count — partial views (slicing) cannot be handled
-    // as a TRT reshape.  In practice, partial views are followed by CONT
-    // which creates a TRT subgraph boundary.
-    if (!is_reshape_valid(src_dims, target_dims)) {
-        GGML_LOG_ERROR("%s: view element count mismatch: %s -> %s (partial view not supported in TRT)\n",
-            __func__, dims_to_string(src_dims).c_str(),
-            dims_to_string(target_dims).c_str());
-        return nullptr;
+    // Validate element count — skip if any dim is dynamic
+    {
+        bool all_static = true;
+        for (int i = 0; i < src_dims.nbDims; i++) {
+            if (src_dims.d[i] == -1) { all_static = false; break; }
+        }
+        for (int i = 0; i < safe_dims.nbDims; i++) {
+            if (safe_dims.d[i] <= 0) { all_static = false; break; }
+        }
+        if (all_static && !is_reshape_valid(src_dims, safe_dims)) {
+            GGML_LOG_ERROR("%s: view element count mismatch: %s -> %s (partial view not supported in TRT)\n",
+                __func__, dims_to_string(src_dims).c_str(),
+                dims_to_string(safe_dims).c_str());
+            return nullptr;
+        }
     }
 
     auto* network = builder->get_network();
@@ -229,7 +251,7 @@ nvinfer1::ITensor* handle_view(NetworkBuilder* builder, const ggml_tensor* node)
         return nullptr;
     }
 
-    shuffle->setReshapeDimensions(target_dims);
+    shuffle->setReshapeDimensions(safe_dims);
 
     std::string layer_name = "view_" + std::to_string(reinterpret_cast<uintptr_t>(node));
     shuffle->setName(layer_name.c_str());

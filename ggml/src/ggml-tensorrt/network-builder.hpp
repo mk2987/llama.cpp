@@ -33,6 +33,11 @@ public:
     // Add a GGML tensor as an input to the network
     nvinfer1::ITensor* add_input(const ggml_tensor* tensor, const std::string& name);
 
+    // Add a GGML tensor as an input with dynamic shape support.
+    // When is_dynamic=true, all dimensions are set to -1 (TRT wildcard).
+    // TRT resolves the actual shape at runtime via setInputShape().
+    nvinfer1::ITensor* add_input(const ggml_tensor* tensor, const std::string& name, bool is_dynamic);
+
     // Get or create a TensorRT ITensor for a GGML tensor
     // If the tensor is already converted, returns the cached version
     nvinfer1::ITensor* get_tensor(const ggml_tensor* tensor);
@@ -84,6 +89,28 @@ public:
     nvinfer1::ITensor* maybe_cast(
         nvinfer1::ITensor* tensor,
         nvinfer1::DataType target_type
+    );
+
+    // Build a 1D I32 shape tensor for ISliceLayer that copies dims from the
+    // input's runtime shape, with one dim overridden to a static value.
+    // Used when dynamic input dims make static ISliceLayer sizes impossible.
+    // Returns a shape tensor suitable for ISliceLayer::setInput(2, ...).
+    nvinfer1::ITensor* make_slice_size(
+        nvinfer1::ITensor* input,
+        int override_dim,
+        int64_t override_value
+    );
+
+    // Make reshape dimensions safe for dynamic inputs by replacing concrete
+    // dims with `0` (copy from input) where the input has wildcard dims (-1).
+    // If the ranks differ or a split/merge prevents direct copy, uses `-1`
+    // (infer from total) for exactly one dynamic dim.
+    // This is needed because ggml_tensor_to_dims always returns concrete shapes
+    // (GGML computes shapes eagerly), but TRT needs special values when the
+    // input tensor has wildcard dimensions.
+    static nvinfer1::Dims make_dynamic_reshape_dims(
+        nvinfer1::ITensor* input,
+        nvinfer1::Dims target_dims
     );
 
     // Pad a tensor with leading 1-dims so it has target_ndims dimensions.

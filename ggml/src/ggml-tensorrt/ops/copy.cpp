@@ -32,12 +32,14 @@ static nvinfer1::ITensor* handle_cpy(NetworkBuilder* builder, const ggml_tensor*
 
     // Reshape if output dimensions differ from source
     nvinfer1::Dims dst_dims = ggml_tensor_to_dims(node);
+    nvinfer1::Dims safe_dims = NetworkBuilder::make_dynamic_reshape_dims(output, dst_dims);
     nvinfer1::Dims out_dims = output->getDimensions();
 
-    bool dims_match = (out_dims.nbDims == dst_dims.nbDims);
+    bool dims_match = (out_dims.nbDims == safe_dims.nbDims);
     if (dims_match) {
         for (int i = 0; i < out_dims.nbDims; i++) {
-            if (out_dims.d[i] != dst_dims.d[i]) {
+            if (safe_dims.d[i] == 0) continue;  // copy-through always matches
+            if (out_dims.d[i] != safe_dims.d[i]) {
                 dims_match = false;
                 break;
             }
@@ -51,7 +53,7 @@ static nvinfer1::ITensor* handle_cpy(NetworkBuilder* builder, const ggml_tensor*
             GGML_LOG_ERROR("%s: failed to create shuffle layer for CPY reshape\n", __func__);
             return nullptr;
         }
-        shuffle->setReshapeDimensions(dst_dims);
+        shuffle->setReshapeDimensions(safe_dims);
 
         std::string layer_name = "cpy_reshape_" + std::to_string(reinterpret_cast<uintptr_t>(node));
         shuffle->setName(layer_name.c_str());
@@ -83,13 +85,15 @@ static nvinfer1::ITensor* handle_cont(NetworkBuilder* builder, const ggml_tensor
     }
 
     nvinfer1::Dims dst_dims = ggml_tensor_to_dims(node);
+    nvinfer1::Dims safe_dims = NetworkBuilder::make_dynamic_reshape_dims(trt_src, dst_dims);
     nvinfer1::Dims src_dims = trt_src->getDimensions();
 
     // If dims already match, pass through (no-op)
-    bool dims_match = (src_dims.nbDims == dst_dims.nbDims);
+    bool dims_match = (src_dims.nbDims == safe_dims.nbDims);
     if (dims_match) {
         for (int i = 0; i < src_dims.nbDims; i++) {
-            if (src_dims.d[i] != dst_dims.d[i]) {
+            if (safe_dims.d[i] == 0) continue;  // copy-through always matches
+            if (src_dims.d[i] != safe_dims.d[i]) {
                 dims_match = false;
                 break;
             }
@@ -107,7 +111,7 @@ static nvinfer1::ITensor* handle_cont(NetworkBuilder* builder, const ggml_tensor
         return nullptr;
     }
 
-    shuffle->setReshapeDimensions(dst_dims);
+    shuffle->setReshapeDimensions(safe_dims);
 
     std::string layer_name = "cont_" + std::to_string(reinterpret_cast<uintptr_t>(node));
     shuffle->setName(layer_name.c_str());

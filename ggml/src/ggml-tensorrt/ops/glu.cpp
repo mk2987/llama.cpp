@@ -74,7 +74,8 @@ nvinfer1::ITensor* handle_glu(NetworkBuilder* builder, const ggml_tensor* node) 
         //             so the split is along the last TRT dimension.
         nvinfer1::Dims src_dims = trt_src0->getDimensions();
         int split_axis = src_dims.nbDims - 1;  // last dimension = ne[0] in GGML
-        int64_t nc = src_dims.d[split_axis] / 2;
+        // Use GGML shape for nc (always concrete, even for dynamic inputs)
+        int64_t nc = src0->ne[0] / 2;
 
         // Build start/size/stride for ISliceLayer
         nvinfer1::Dims start, size, stride;
@@ -83,10 +84,18 @@ nvinfer1::ITensor* handle_glu(NetworkBuilder* builder, const ggml_tensor* node) 
         stride.nbDims = src_dims.nbDims;
         for (int i = 0; i < src_dims.nbDims; i++) {
             start.d[i] = 0;
-            size.d[i] = src_dims.d[i];
+            size.d[i] = 1;  // placeholder for shape tensor
             stride.d[i] = 1;
         }
         size.d[split_axis] = nc;
+
+        // Shape tensor: copies dynamic dims from input, overrides split axis = nc
+        nvinfer1::ITensor* half_size_tensor = builder->make_slice_size(
+            trt_src0, split_axis, nc);
+        if (half_size_tensor == nullptr) {
+            GGML_LOG_ERROR("%s: failed to create half size tensor\n", __func__);
+            return nullptr;
+        }
 
         // First half: start at 0
         nvinfer1::Dims start_first = start;
@@ -95,6 +104,7 @@ nvinfer1::ITensor* handle_glu(NetworkBuilder* builder, const ggml_tensor* node) 
             GGML_LOG_ERROR("%s: failed to create first half slice\n", __func__);
             return nullptr;
         }
+        slice_first->setInput(2, *half_size_tensor);
         nvinfer1::ITensor* first_half = slice_first->getOutput(0);
 
         // Second half: start at nc along split axis
@@ -105,6 +115,7 @@ nvinfer1::ITensor* handle_glu(NetworkBuilder* builder, const ggml_tensor* node) 
             GGML_LOG_ERROR("%s: failed to create second half slice\n", __func__);
             return nullptr;
         }
+        slice_second->setInput(2, *half_size_tensor);
         nvinfer1::ITensor* second_half = slice_second->getOutput(0);
 
         // Default: data = first half ([:nc]), gate = second half ([nc:])

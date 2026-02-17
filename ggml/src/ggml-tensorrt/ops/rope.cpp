@@ -69,7 +69,8 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
     const int ndims = input_dims.nbDims;
     // TRT last dim = head_dim (GGML ne[0])
     const int last_axis = ndims - 1;
-    const int64_t head_dim = input_dims.d[last_axis];
+    // head_dim from GGML (always concrete, even for dynamic inputs)
+    const int64_t head_dim = src0->ne[0];
 
     // Unique name prefix for layer naming
     std::string pfx = "rope_" + std::to_string(reinterpret_cast<uintptr_t>(node));
@@ -109,7 +110,8 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
         reshape_dims.nbDims = ndims;
         for (int i = 0; i < ndims; i++) {
             if (i < pos_dims.nbDims) {
-                reshape_dims.d[i] = pos_dims.d[i];
+                // Use 0 (copy from input) for dynamic dims
+                reshape_dims.d[i] = (pos_dims.d[i] == -1) ? 0 : pos_dims.d[i];
             } else {
                 reshape_dims.d[i] = 1;
             }
@@ -165,10 +167,12 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
     if (has_passthrough) {
         nvinfer1::Dims pass_start = start_zero;
         pass_start.d[last_axis] = n_dims;
+
+        // Use placeholder size (1s) + shape tensor for dynamic dims
         nvinfer1::Dims pass_size;
         pass_size.nbDims = ndims;
         for (int i = 0; i < ndims; i++) {
-            pass_size.d[i] = input_dims.d[i];
+            pass_size.d[i] = 1;  // placeholder
         }
         pass_size.d[last_axis] = head_dim - n_dims;
 
@@ -177,6 +181,15 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
             GGML_LOG_ERROR("%s: failed to create passthrough slice\n", __func__);
             return nullptr;
         }
+        // Override size with shape tensor — copies dynamic dims from input,
+        // overrides last axis with the static passthrough size
+        nvinfer1::ITensor* pass_size_tensor = builder->make_slice_size(
+            input, last_axis, head_dim - n_dims);
+        if (pass_size_tensor == nullptr) {
+            GGML_LOG_ERROR("%s: failed to create passthrough size tensor\n", __func__);
+            return nullptr;
+        }
+        pass_slice->setInput(2, *pass_size_tensor);
         pass_slice->setName((pfx + "_pass").c_str());
         x_pass = pass_slice->getOutput(0);
     }
@@ -187,15 +200,24 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
         nvinfer1::Dims half_size;
         half_size.nbDims = ndims;
         for (int i = 0; i < ndims; i++) {
-            half_size.d[i] = input_dims.d[i];
+            half_size.d[i] = 1;  // placeholder for shape tensor
         }
         half_size.d[last_axis] = half;
+
+        // Shape tensor: copies dynamic dims from input, override last axis = half
+        nvinfer1::ITensor* half_size_tensor = builder->make_slice_size(
+            input, last_axis, half);
+        if (half_size_tensor == nullptr) {
+            GGML_LOG_ERROR("%s: failed to create half size tensor (NEOX)\n", __func__);
+            return nullptr;
+        }
 
         auto* slice_x0 = network->addSlice(*input, start_zero, half_size, stride_ones);
         if (slice_x0 == nullptr) {
             GGML_LOG_ERROR("%s: failed to create x0 slice (NEOX)\n", __func__);
             return nullptr;
         }
+        slice_x0->setInput(2, *half_size_tensor);
         slice_x0->setName((pfx + "_x0").c_str());
         x0 = slice_x0->getOutput(0);
 
@@ -206,6 +228,7 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
             GGML_LOG_ERROR("%s: failed to create x1 slice (NEOX)\n", __func__);
             return nullptr;
         }
+        slice_x1->setInput(2, *half_size_tensor);
         slice_x1->setName((pfx + "_x1").c_str());
         x1 = slice_x1->getOutput(0);
     } else {
@@ -214,7 +237,7 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
         nvinfer1::Dims rot_size;
         rot_size.nbDims = ndims;
         for (int i = 0; i < ndims; i++) {
-            rot_size.d[i] = input_dims.d[i];
+            rot_size.d[i] = 1;  // placeholder for shape tensor
         }
         rot_size.d[last_axis] = n_dims;
 
@@ -224,14 +247,24 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
             GGML_LOG_ERROR("%s: failed to create rotation slice (NORMAL)\n", __func__);
             return nullptr;
         }
+        // Shape tensor: copy dynamic dims from input, override last axis = n_dims
+        nvinfer1::ITensor* rot_size_tensor = builder->make_slice_size(
+            input, last_axis, n_dims);
+        if (rot_size_tensor == nullptr) {
+            GGML_LOG_ERROR("%s: failed to create rot size tensor (NORMAL)\n", __func__);
+            return nullptr;
+        }
+        rot_slice->setInput(2, *rot_size_tensor);
         rot_slice->setName((pfx + "_rot_slice").c_str());
         nvinfer1::ITensor* x_rot = rot_slice->getOutput(0);
 
         // Reshape to (..., half, 2)
+        // Use 0 for dynamic dims (batch/tokens at position 0)
         nvinfer1::Dims pairs_dims;
         pairs_dims.nbDims = ndims + 1;
         for (int i = 0; i < last_axis; i++) {
-            pairs_dims.d[i] = input_dims.d[i];
+            // Position i in x_rot corresponds to position i in input — use 0 for dynamic
+            pairs_dims.d[i] = (input_dims.d[i] == -1) ? 0 : input_dims.d[i];
         }
         pairs_dims.d[last_axis] = half;
         pairs_dims.d[last_axis + 1] = 2;
@@ -253,10 +286,18 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
         elem_stride.nbDims = ndims + 1;
         for (int i = 0; i < ndims + 1; i++) {
             elem_start.d[i] = 0;
-            elem_size.d[i] = pairs_dims.d[i];
+            elem_size.d[i] = 1;  // placeholder for shape tensor
             elem_stride.d[i] = 1;
         }
-        elem_size.d[pair_axis] = 1;
+        elem_size.d[pair_axis] = 1;  // slice 1 element along pair axis
+
+        // Shape tensor for elem slice: copy all dims from x_pairs, override pair_axis=1
+        nvinfer1::ITensor* elem_size_tensor = builder->make_slice_size(
+            x_pairs, pair_axis, 1);
+        if (elem_size_tensor == nullptr) {
+            GGML_LOG_ERROR("%s: failed to create elem size tensor (NORMAL)\n", __func__);
+            return nullptr;
+        }
 
         // x0 = even elements (start=0 on pair_axis)
         auto* slice_even = network->addSlice(*x_pairs, elem_start, elem_size, elem_stride);
@@ -264,6 +305,7 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
             GGML_LOG_ERROR("%s: failed to create even slice (NORMAL)\n", __func__);
             return nullptr;
         }
+        slice_even->setInput(2, *elem_size_tensor);
         slice_even->setName((pfx + "_even").c_str());
         x0 = slice_even->getOutput(0);
 
@@ -275,21 +317,19 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
             GGML_LOG_ERROR("%s: failed to create odd slice (NORMAL)\n", __func__);
             return nullptr;
         }
+        slice_odd->setInput(2, *elem_size_tensor);
         slice_odd->setName((pfx + "_odd").c_str());
         x1 = slice_odd->getOutput(0);
 
         // cos/sin need to be reshaped to (..., half, 1) for NORMAL mode broadcasting
-        nvinfer1::Dims trig_dims;
-        trig_dims.nbDims = ndims + 1;
-        for (int i = 0; i < ndims; i++) {
-            trig_dims.d[i] = 1;
-        }
-        // pos dim (first dim of theta output) should inherit from theta
         // theta shape is (n_tokens, 1, ..., half) in TRT
         // We need cos/sin to be (n_tokens, 1, ..., half, 1)
+        nvinfer1::Dims trig_dims;
+        trig_dims.nbDims = ndims + 1;
         nvinfer1::Dims theta_dims = cos_theta->getDimensions();
         for (int i = 0; i < ndims; i++) {
-            trig_dims.d[i] = theta_dims.d[i];
+            // Use 0 (copy from input) for dynamic dims
+            trig_dims.d[i] = (theta_dims.d[i] == -1) ? 0 : theta_dims.d[i];
         }
         trig_dims.d[ndims] = 1;  // trailing 1 for pair_axis broadcasting
 
@@ -382,10 +422,11 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
         nvinfer1::ITensor* interleaved = concat_layer->getOutput(0);
 
         // Reshape back from (..., half, 2) to (..., n_dims)
+        // Use 0 for dynamic dims (batch/tokens)
         nvinfer1::Dims flat_dims;
         flat_dims.nbDims = ndims;
         for (int i = 0; i < last_axis; i++) {
-            flat_dims.d[i] = input_dims.d[i];
+            flat_dims.d[i] = (input_dims.d[i] == -1) ? 0 : input_dims.d[i];
         }
         flat_dims.d[last_axis] = n_dims;
 

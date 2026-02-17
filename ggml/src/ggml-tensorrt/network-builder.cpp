@@ -62,6 +62,123 @@ nvinfer1::ITensor* NetworkBuilder::add_input(const ggml_tensor* tensor, const st
     return trt_tensor;
 }
 
+nvinfer1::ITensor* NetworkBuilder::add_input(const ggml_tensor* tensor, const std::string& name, bool is_dynamic) {
+    GGML_ASSERT(tensor != nullptr);
+
+    // Check if tensor is already added
+    if (has_tensor(tensor)) {
+        return get_tensor(tensor);
+    }
+
+    // Validate tensor
+    if (!validate_tensor_for_tensorrt(tensor)) {
+        GGML_LOG_ERROR("%s: tensor validation failed for %s\n", __func__, name.c_str());
+        return nullptr;
+    }
+
+    // Convert data type
+    nvinfer1::DataType dtype = ggml_type_to_tensorrt(tensor->type);
+
+    nvinfer1::Dims dims;
+    if (is_dynamic) {
+        // Dynamic input: use -1 for all dims (TRT wildcard)
+        // ndims must still match the tensor's rank
+        dims = ggml_tensor_to_dims(tensor);
+        for (int i = 0; i < dims.nbDims; i++) {
+            dims.d[i] = -1;
+        }
+    } else {
+        // Static input: concrete dims
+        dims = ggml_tensor_to_dims(tensor);
+    }
+
+    // Add input to network
+    nvinfer1::ITensor* trt_tensor = network_->addInput(name.c_str(), dtype, dims);
+    if (trt_tensor == nullptr) {
+        GGML_LOG_ERROR("%s: failed to add input %s (dynamic=%d)\n", __func__, name.c_str(), is_dynamic);
+        return nullptr;
+    }
+
+    // Store in map
+    set_tensor(tensor, trt_tensor);
+
+    GGML_LOG_DEBUG("%s: added %s input %s with shape %s\n",
+        __func__, is_dynamic ? "dynamic" : "static",
+        name.c_str(), dims_to_string(dims).c_str());
+
+    return trt_tensor;
+}
+
+nvinfer1::ITensor* NetworkBuilder::make_slice_size(
+    nvinfer1::ITensor* input,
+    int override_dim,
+    int64_t override_value
+) {
+    GGML_ASSERT(input != nullptr);
+
+    nvinfer1::Dims input_dims = input->getDimensions();
+    int ndims = input_dims.nbDims;
+    GGML_ASSERT(override_dim >= 0 && override_dim < ndims);
+
+    // Get the runtime shape of the input as a 1D I32 tensor
+    auto* shape_layer = network_->addShape(*input);
+    if (shape_layer == nullptr) {
+        GGML_LOG_ERROR("%s: failed to create shape layer\n", __func__);
+        return nullptr;
+    }
+    nvinfer1::ITensor* shape_tensor = shape_layer->getOutput(0);
+    // shape_tensor is 1D with ndims elements: [d0, d1, ..., d_{n-1}]
+
+    // Create a constant for the override value
+    int32_t override_i32 = static_cast<int32_t>(override_value);
+    nvinfer1::Dims scalar_dims{1, {1}};
+    nvinfer1::Weights override_weights{nvinfer1::DataType::kINT32, nullptr, 1};
+
+    // Store override value persistently
+    weight_storage_.emplace_back(sizeof(int32_t));
+    memcpy(weight_storage_.back().data(), &override_i32, sizeof(int32_t));
+    override_weights.values = weight_storage_.back().data();
+
+    auto* override_const = network_->addConstant(scalar_dims, override_weights);
+    if (override_const == nullptr) {
+        GGML_LOG_ERROR("%s: failed to create override constant\n", __func__);
+        return nullptr;
+    }
+    nvinfer1::ITensor* override_tensor = override_const->getOutput(0);
+
+    // Extract individual dims from the shape tensor using slices,
+    // then replace the override_dim with our constant.
+    // Build per-dim tensors, then concatenate.
+    std::vector<nvinfer1::ITensor*> dim_tensors(ndims);
+
+    for (int i = 0; i < ndims; i++) {
+        if (i == override_dim) {
+            dim_tensors[i] = override_tensor;
+        } else {
+            // Slice out element i from the shape tensor
+            nvinfer1::Dims slice_start{1, {i}};
+            nvinfer1::Dims slice_size{1, {1}};
+            nvinfer1::Dims slice_stride{1, {1}};
+            auto* dim_slice = network_->addSlice(*shape_tensor, slice_start, slice_size, slice_stride);
+            if (dim_slice == nullptr) {
+                GGML_LOG_ERROR("%s: failed to slice dim %d from shape\n", __func__, i);
+                return nullptr;
+            }
+            dim_tensors[i] = dim_slice->getOutput(0);
+        }
+    }
+
+    // Concatenate all dim tensors into a single 1D shape tensor
+    auto* concat = network_->addConcatenation(dim_tensors.data(), ndims);
+    if (concat == nullptr) {
+        GGML_LOG_ERROR("%s: failed to concatenate dim tensors\n", __func__);
+        return nullptr;
+    }
+    concat->setAxis(0);
+
+    return concat->getOutput(0);
+}
+
 nvinfer1::ITensor* NetworkBuilder::get_tensor(const ggml_tensor* tensor) {
     GGML_ASSERT(tensor != nullptr);
 
@@ -264,8 +381,24 @@ nvinfer1::ITensor* NetworkBuilder::pad_to_ndims(
     for (int i = 0; i < pad; i++) {
         new_dims.d[i] = 1;
     }
+    // When padding adds leading 1-dims, the output position pad+i corresponds
+    // to input position i.  TRT's special value 0 copies from the SAME position
+    // in the input, not offset by pad.  So we use -1 (infer) for one dynamic
+    // dim, which is correct when there's at most one dynamic dim.
+    bool used_infer = false;
     for (int i = 0; i < current.nbDims; i++) {
-        new_dims.d[pad + i] = current.d[i];
+        if (current.d[i] == -1) {
+            if (!used_infer) {
+                new_dims.d[pad + i] = -1;
+                used_infer = true;
+            } else {
+                // Multiple dynamic dims — fall back to concrete value from current.
+                // This shouldn't happen for typical pad_to_ndims usage.
+                new_dims.d[pad + i] = current.d[i];
+            }
+        } else {
+            new_dims.d[pad + i] = current.d[i];
+        }
     }
 
     auto* shuffle = network_->addShuffle(*tensor);
@@ -275,6 +408,67 @@ nvinfer1::ITensor* NetworkBuilder::pad_to_ndims(
     }
     shuffle->setReshapeDimensions(new_dims);
     return shuffle->getOutput(0);
+}
+
+nvinfer1::Dims NetworkBuilder::make_dynamic_reshape_dims(
+    nvinfer1::ITensor* input,
+    nvinfer1::Dims target_dims
+) {
+    GGML_ASSERT(input != nullptr);
+
+    nvinfer1::Dims input_dims = input->getDimensions();
+
+    // Check if any input dim is dynamic (-1)
+    bool has_dynamic = false;
+    for (int i = 0; i < input_dims.nbDims; i++) {
+        if (input_dims.d[i] == -1) {
+            has_dynamic = true;
+            break;
+        }
+    }
+    if (!has_dynamic) {
+        return target_dims;  // all static, use concrete dims as-is
+    }
+
+    // Strategy: for each dynamic dim (-1) in the input, find its
+    // corresponding position in the target and use `0` (copy from input).
+    // If ranks match, positions correspond 1:1.
+    // If ranks differ, the batch dim (first) usually stays at position 0.
+
+    if (input_dims.nbDims == target_dims.nbDims) {
+        // Same rank: copy-through for matching positions with -1
+        for (int i = 0; i < input_dims.nbDims; i++) {
+            if (input_dims.d[i] == -1) {
+                target_dims.d[i] = 0;  // copy from input at this position
+            }
+        }
+    } else {
+        // Different rank (split or merge).
+        // The batch dim is always at position 0 (outermost in TRT).
+        // Use 0 at position 0 if input dim 0 is dynamic.
+        // Use -1 (infer) for any other position that can't be resolved.
+        //
+        // Count dynamic dims to decide strategy
+        bool used_infer = false;
+        if (input_dims.d[0] == -1) {
+            target_dims.d[0] = 0;  // copy batch dim from input
+        }
+        // For remaining dynamic input dims at positions > 0, we can't
+        // use 0 because the position mapping isn't 1:1.
+        // Check if any other input dim is dynamic and needs handling.
+        for (int i = 1; i < input_dims.nbDims; i++) {
+            if (input_dims.d[i] == -1) {
+                // Multiple dynamic dims in different-rank reshape.
+                // Use -1 (infer) for the last target dim if not already used.
+                if (!used_infer) {
+                    target_dims.d[target_dims.nbDims - 1] = -1;
+                    used_infer = true;
+                }
+            }
+        }
+    }
+
+    return target_dims;
 }
 
 nvinfer1::ITensor* apply_activation(

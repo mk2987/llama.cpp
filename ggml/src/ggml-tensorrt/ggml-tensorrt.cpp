@@ -1,6 +1,7 @@
 #include "common.hpp"
 #include "network-builder.hpp"
 #include "engine-manager.hpp"
+#include "utils/tensor-utils.hpp"
 #include "utils/type-utils.hpp"
 #include "kernels/set-rows.cuh"
 #include "ggml-tensorrt.h"
@@ -321,6 +322,14 @@ static void ggml_backend_tensorrt_synchronize(ggml_backend_t backend) {
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
 }
 
+// Classify a leaf tensor as "static" (shape doesn't change between calls).
+// Static leaves are model weights and normalization scales — they have
+// GGML_OP_NONE and a non-I32 type.  Everything else (activations, positions,
+// KV cache views) is "dynamic" — its batch/token dimension changes.
+static bool is_static_leaf(const ggml_tensor * tensor) {
+    return tensor->op == GGML_OP_NONE && tensor->type != GGML_TYPE_I32;
+}
+
 // Check if an op is a shape/metadata operation (zero-copy in GGML).
 // These share data pointers with their source and must NOT be marked as
 // TRT engine outputs (that would create duplicate address bindings).
@@ -543,13 +552,29 @@ static enum ggml_status execute_trt_segment(
         return false;
     };
 
+    // ── Classify leaves as static (weights) or dynamic (activations) ──
+    //
+    // Static leaves have constant shapes across all calls (model weights,
+    // normalization scales).  Dynamic leaves have batch/token dims that change
+    // between prompt and decode (hidden states, position IDs, KV views).
+
+    std::unordered_set<const ggml_tensor *> static_leaf_set;
+    bool has_dynamic_inputs = false;
+    for (size_t k = 0; k < leaf_tensors.size(); k++) {
+        if (is_static_leaf(leaf_tensors[k])) {
+            static_leaf_set.insert(leaf_tensors[k]);
+        } else {
+            has_dynamic_inputs = true;
+        }
+    }
+
     // ── Engine cache lookup ──
     //
-    // The graph hash covers ops, shapes, and types but NOT data addresses.
-    // Output detection is now address-independent (flag + consumer analysis),
-    // so the hash is purely structural — no output pattern mixing needed.
+    // Shape-agnostic hash: static leaf shapes are fully hashed (weight dims
+    // are constant), dynamic tensor shapes are excluded (only type + ndims).
+    // This makes the hash batch-independent — one engine serves all batch sizes.
 
-    uint64_t hash = compute_graph_hash(cgraph, trt_node_indices);
+    uint64_t hash = compute_graph_hash(cgraph, trt_node_indices, static_leaf_set);
 
     nvinfer1::ICudaEngine* engine = ctx->engine_mgr->get_cached_engine(hash);
 
@@ -620,11 +645,13 @@ static enum ggml_status execute_trt_segment(
 
         NetworkBuilder net_builder(network.get(), ctx->logger);
 
-        // Add leaf tensors as inputs with positional names
+        // Add leaf tensors as inputs with positional names.
+        // Dynamic leaves get wildcard dims (-1); static leaves get concrete dims.
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
             char name[64];
             snprintf(name, sizeof(name), "input_%zu", k);
-            if (!net_builder.add_input(leaf_tensors[k], name)) {
+            bool is_dynamic = !static_leaf_set.count(leaf_tensors[k]);
+            if (!net_builder.add_input(leaf_tensors[k], name, is_dynamic)) {
                 GGML_LOG_ERROR("%s: failed to add input tensor input_%zu\n", __func__, k);
                 return GGML_STATUS_FAILED;
             }
@@ -703,7 +730,42 @@ static enum ggml_status execute_trt_segment(
             }
         }
 
-        engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config);
+        // Build optimization profiles for dynamic inputs
+        std::vector<input_profile> profiles;
+        if (has_dynamic_inputs) {
+            for (size_t k = 0; k < leaf_tensors.size(); k++) {
+                char name[64];
+                snprintf(name, sizeof(name), "input_%zu", k);
+                nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
+
+                input_profile p;
+                p.name = name;
+
+                if (static_leaf_set.count(leaf_tensors[k])) {
+                    // Static: min = opt = max = actual
+                    p.min_dims = actual;
+                    p.opt_dims = actual;
+                    p.max_dims = actual;
+                } else {
+                    // Dynamic: min=1 for all dims, opt=actual, max=max(actual*4, 2048)
+                    p.min_dims = actual;
+                    p.opt_dims = actual;
+                    p.max_dims = actual;
+                    for (int d = 0; d < actual.nbDims; d++) {
+                        p.min_dims.d[d] = 1;
+                        int64_t expanded = actual.d[d] * 4;
+                        p.max_dims.d[d] = expanded > 2048 ? expanded : 2048;
+                    }
+                }
+                profiles.push_back(p);
+            }
+        }
+
+        if (has_dynamic_inputs) {
+            engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config, profiles);
+        } else {
+            engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config);
+        }
         if (!engine) {
             GGML_LOG_ERROR("%s: failed to build TensorRT engine\n", __func__);
             return GGML_STATUS_FAILED;
@@ -714,10 +776,27 @@ static enum ggml_status execute_trt_segment(
 
     // ── Execute ──
 
-    nvinfer1::IExecutionContext* exec_ctx = ctx->engine_mgr->get_or_create_context(hash);
+    // Disable CUDA graphs for dynamic-shape engines — shape changes break replay
+    bool enable_cuda_graphs = !has_dynamic_inputs;
+    nvinfer1::IExecutionContext* exec_ctx = ctx->engine_mgr->get_or_create_context(hash, enable_cuda_graphs);
     if (!exec_ctx) {
         GGML_LOG_ERROR("%s: failed to get execution context\n", __func__);
         return GGML_STATUS_FAILED;
+    }
+
+    // Set actual input shapes for all inputs (required before enqueueV3
+    // when using optimization profiles — TRT needs concrete shapes for both
+    // static and dynamic inputs in the profile).
+    if (has_dynamic_inputs) {
+        for (size_t k = 0; k < leaf_tensors.size(); k++) {
+            char name[64];
+            snprintf(name, sizeof(name), "input_%zu", k);
+            nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
+            if (!exec_ctx->setInputShape(name, actual)) {
+                GGML_LOG_ERROR("%s: failed to set input shape for %s\n", __func__, name);
+                return GGML_STATUS_FAILED;
+            }
+        }
     }
 
     // ── I/O aliasing guard ──

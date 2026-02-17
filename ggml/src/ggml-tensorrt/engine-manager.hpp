@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <map>
+#include <unordered_set>
 #include <vector>
 
 namespace ggml_tensorrt {
@@ -30,6 +31,26 @@ uint64_t compute_graph_hash(const ggml_cgraph * cgraph);
 // whose parameters change every token are excluded.
 uint64_t compute_graph_hash(const ggml_cgraph * cgraph, const std::vector<int> & node_indices);
 
+// Compute a shape-agnostic hash for dynamic input support.
+// Like the node_indices overload, but shapes of dynamic tensors (those NOT
+// in static_leaves) are excluded from the hash.  Only type + ndims are hashed
+// for dynamic tensors.  Static tensor shapes (weights) are fully hashed.
+// This produces batch-independent hashes — different batch sizes yield the
+// same hash, enabling one cached engine to serve all batch sizes.
+uint64_t compute_graph_hash(
+    const ggml_cgraph * cgraph,
+    const std::vector<int> & node_indices,
+    const std::unordered_set<const ggml_tensor *> & static_leaves
+);
+
+// Per-input optimization profile info for dynamic shape engines
+struct input_profile {
+    std::string name;
+    nvinfer1::Dims min_dims;
+    nvinfer1::Dims opt_dims;
+    nvinfer1::Dims max_dims;
+};
+
 // EngineManager handles building, caching, and executing TensorRT engines
 class EngineManager {
 public:
@@ -42,6 +63,16 @@ public:
         nvinfer1::IBuilder* builder,
         nvinfer1::INetworkDefinition* network,
         const EngineConfig& config
+    );
+
+    // Build an engine with optimization profiles for dynamic input shapes.
+    // Each input_profile specifies min/opt/max dims for one network input.
+    // Static inputs have min=opt=max.  Dynamic inputs allow range of shapes.
+    nvinfer1::ICudaEngine* build_engine(
+        nvinfer1::IBuilder* builder,
+        nvinfer1::INetworkDefinition* network,
+        const EngineConfig& config,
+        const std::vector<input_profile>& profiles
     );
 
     // Create an execution context from an engine
@@ -63,7 +94,8 @@ public:
 
     // Get or create an execution context for a cached engine.
     // Returns a reusable context — caller must rebind tensor addresses before use.
-    nvinfer1::IExecutionContext* get_or_create_context(uint64_t hash);
+    // use_cuda_graphs overrides the instance-level setting for this specific context.
+    nvinfer1::IExecutionContext* get_or_create_context(uint64_t hash, bool use_cuda_graphs);
 
     // Enable or disable CUDA graph capture for new execution contexts
     void set_cuda_graphs(bool enabled);
