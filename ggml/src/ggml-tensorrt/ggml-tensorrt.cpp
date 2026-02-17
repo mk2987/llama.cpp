@@ -798,7 +798,7 @@ static enum ggml_status execute_trt_segment(
                     }
                 }
             }
-            GGML_LOG_ERROR("%s: building engine (segment %" PRId64 ", hash 0x%016" PRIx64
+            GGML_LOG_DEBUG("%s: building engine (segment %" PRId64 ", hash 0x%016" PRIx64
                 ", %zu nodes, %zu leaves [%zu static, %zu dynamic], "
                 "workspace %zu MB, GPU free %zu MB / %zu MB, "
                 "dynamic=%s, dim0_cap=%" PRId64 ", max_weight_dim=%" PRId64
