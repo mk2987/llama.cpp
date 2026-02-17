@@ -120,7 +120,8 @@ nvinfer1::ITensor* NetworkBuilder::make_slice_size(
     int ndims = input_dims.nbDims;
     GGML_ASSERT(override_dim >= 0 && override_dim < ndims);
 
-    // Get the runtime shape of the input as a 1D I32 tensor
+    // Get the runtime shape of the input as a 1D tensor.
+    // TRT-RTX's IShapeLayer returns Int64 (not Int32 like standard TRT).
     auto* shape_layer = network_->addShape(*input);
     if (shape_layer == nullptr) {
         GGML_LOG_ERROR("%s: failed to create shape layer\n", __func__);
@@ -129,14 +130,22 @@ nvinfer1::ITensor* NetworkBuilder::make_slice_size(
     nvinfer1::ITensor* shape_tensor = shape_layer->getOutput(0);
     // shape_tensor is 1D with ndims elements: [d0, d1, ..., d_{n-1}]
 
-    // Create a constant for the override value
-    int32_t override_i32 = static_cast<int32_t>(override_value);
-    nvinfer1::Dims scalar_dims{1, {1}};
-    nvinfer1::Weights override_weights{nvinfer1::DataType::kINT32, nullptr, 1};
+    // Determine the type of the shape tensor (Int64 on TRT-RTX, Int32 on older TRT)
+    nvinfer1::DataType shape_type = shape_tensor->getType();
 
-    // Store override value persistently
-    weight_storage_.emplace_back(sizeof(int32_t));
-    memcpy(weight_storage_.back().data(), &override_i32, sizeof(int32_t));
+    // Create a constant for the override value matching the shape tensor type
+    nvinfer1::Dims scalar_dims{1, {1}};
+    nvinfer1::Weights override_weights{shape_type, nullptr, 1};
+
+    if (shape_type == nvinfer1::DataType::kINT64) {
+        int64_t override_i64 = override_value;
+        weight_storage_.emplace_back(sizeof(int64_t));
+        memcpy(weight_storage_.back().data(), &override_i64, sizeof(int64_t));
+    } else {
+        int32_t override_i32 = static_cast<int32_t>(override_value);
+        weight_storage_.emplace_back(sizeof(int32_t));
+        memcpy(weight_storage_.back().data(), &override_i32, sizeof(int32_t));
+    }
     override_weights.values = weight_storage_.back().data();
 
     auto* override_const = network_->addConstant(scalar_dims, override_weights);
