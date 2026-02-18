@@ -160,23 +160,34 @@ bool is_reshape_valid(const nvinfer1::Dims& src, const nvinfer1::Dims& dst) {
 
 bool validate_tensor_for_tensorrt(const ggml_tensor* tensor) {
     if (tensor == nullptr) {
+        GGML_LOG_ERROR("%s: tensor is null\n", __func__);
         return false;
     }
 
     // Check if type is supported
     if (!is_type_supported(tensor->type)) {
+        GGML_LOG_ERROR("%s: unsupported type %s for tensor %s\n",
+            __func__, ggml_type_name(tensor->type), tensor->name);
         return false;
     }
 
     // Check dimension count
     int n_dims = ggml_n_dims(tensor);
     if (n_dims > nvinfer1::Dims::MAX_DIMS) {
+        GGML_LOG_ERROR("%s: ndims %d exceeds MAX_DIMS %d for tensor %s\n",
+            __func__, n_dims, nvinfer1::Dims::MAX_DIMS, tensor->name);
         return false;
     }
 
     // Check for valid dimensions (no zero or negative sizes)
     for (int i = 0; i < n_dims; ++i) {
         if (tensor->ne[i] <= 0) {
+            GGML_LOG_ERROR("%s: invalid ne[%d]=%lld for tensor %s "
+                "(op=%s type=%s ne=[%lld,%lld,%lld,%lld])\n",
+                __func__, i, (long long)tensor->ne[i], tensor->name,
+                ggml_op_name(tensor->op), ggml_type_name(tensor->type),
+                (long long)tensor->ne[0], (long long)tensor->ne[1],
+                (long long)tensor->ne[2], (long long)tensor->ne[3]);
             return false;
         }
     }
