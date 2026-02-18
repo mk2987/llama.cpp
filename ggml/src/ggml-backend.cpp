@@ -1556,6 +1556,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        // cross-backend synchronization for buffer-compatible backends
+        // when two backends share the same buft (e.g. TRT and CUDA on the
+        // same GPU), the scheduler produces zero-input splits (n_inputs == 0)
+        // because no tensor copies are needed.  but the backends use separate
+        // streams, so we must order them with events to prevent races.
+        if (split_id > 0) {
+            int prev_backend_id = splits[split_id - 1].backend_id;
+            if (prev_backend_id != split_backend_id) {
+                if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                    ggml_backend_event_wait(split_backend, sched->events[prev_backend_id][sched->cur_copy]);
+                } else {
+                    ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                }
+            }
+        }
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1761,11 +1777,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // record the event of this copy
-        if (split->n_inputs > 0) {
-            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
-            }
+        // record the event of this split's completion
+        // always record, even for zero-input splits, so that cross-backend
+        // transitions between buffer-compatible backends (shared buft) are
+        // correctly synchronized via cudaStreamWaitEvent
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
     }
 

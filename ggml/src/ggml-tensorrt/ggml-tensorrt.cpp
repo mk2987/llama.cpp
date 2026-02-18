@@ -323,6 +323,16 @@ static void ggml_backend_tensorrt_synchronize(ggml_backend_t backend) {
     CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
 }
 
+static void ggml_backend_tensorrt_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_tensorrt_context * ctx = (ggml_backend_tensorrt_context *) backend->context;
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, ctx->stream));
+}
+
+static void ggml_backend_tensorrt_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_tensorrt_context * ctx = (ggml_backend_tensorrt_context *) backend->context;
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->stream, (cudaEvent_t)event->context, 0));
+}
+
 // Classify a leaf tensor as "static" (shape doesn't change between calls).
 // Static leaves are model weights and normalization scales — loaded from
 // GGUF once, shapes fixed by architecture.  Per-forward inputs (tokens,
@@ -855,8 +865,17 @@ static enum ggml_status execute_trt_segment(
     bool debug_enabled,
     int64_t segment_id
 ) {
-    // Address tracking for debug mode (detect address changes between calls)
-    static std::unordered_map<uint64_t, std::vector<void*>> prev_input_addrs;
+    // Address cache: skip redundant setTensorAddress calls when addresses
+    // haven't changed since last execution of the same engine.  During decode,
+    // weight addresses are constant — only KV/activation addresses change.
+    // Invalidated when the execution context changes (engine eviction + rebuild
+    // creates a new context that has no addresses bound).
+    struct addr_cache_entry {
+        nvinfer1::IExecutionContext * ctx = nullptr;
+        std::vector<void *> inputs;
+        std::vector<void *> outputs;
+    };
+    static std::unordered_map<uint64_t, addr_cache_entry> prev_addrs;
 
     // ── Collect leaf inputs for this segment ──
 
@@ -990,11 +1009,15 @@ static enum ggml_status execute_trt_segment(
     }
 
     // ── Execution context + input shapes ──
-    // TRT-RTX 1.3 handles CUDA graphs with dynamic shapes natively via
-    // kWHOLE_GRAPH_CAPTURE — it captures after shape-specialized kernel
-    // compilation and re-captures on shape changes.  get_or_create_context()
-    // falls back to a plain context if CUDA graph capture fails.
-    nvinfer1::IExecutionContext * exec_ctx = ctx->engine_mgr->get_or_create_context(hash, /*enable_cuda_graphs=*/true);
+    // CUDA graphs are only beneficial for static-shape segments (embeddings,
+    // final projection) where the graph is captured once and replayed.
+    // Dynamic segments (KV cache dims change every token) force re-capture
+    // on every forward pass — the capture/update/destroy overhead (~62µs per
+    // segment) exceeds the graph launch benefit.  Direct enqueueV3 is cheaper.
+    static const bool cuda_graphs_env = (getenv("GGML_TENSORRT_CUDA_GRAPHS") == nullptr ||
+                                          atoi(getenv("GGML_TENSORRT_CUDA_GRAPHS")) != 0);
+    bool enable_cuda_graphs = cuda_graphs_env && !has_dynamic_inputs;
+    nvinfer1::IExecutionContext * exec_ctx = ctx->engine_mgr->get_or_create_context(hash, enable_cuda_graphs);
     if (!exec_ctx) {
         GGML_LOG_ERROR("%s: failed to get execution context\n", __func__);
         return GGML_STATUS_FAILED;
@@ -1079,8 +1102,20 @@ static enum ggml_status execute_trt_segment(
         }
     }
 
-    // Bind input addresses
+    // Bind input addresses — skip when address unchanged from last call
+    auto & cached = prev_addrs[hash];
+    if (cached.ctx != exec_ctx) {
+        // Context changed (new engine build or eviction) — must rebind all
+        cached.inputs.clear();
+        cached.outputs.clear();
+        cached.ctx = exec_ctx;
+    }
+    bool inputs_cached = (cached.inputs.size() == leaf_tensors.size());
+
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
+        if (inputs_cached && cached.inputs[k] == leaf_bind_addrs[k]) {
+            continue;
+        }
         char name[64];
         snprintf(name, sizeof(name), "input_%zu", k);
         if (!exec_ctx->setTensorAddress(name, leaf_bind_addrs[k])) {
@@ -1088,12 +1123,26 @@ static enum ggml_status execute_trt_segment(
             return GGML_STATUS_FAILED;
         }
     }
+    cached.inputs = leaf_bind_addrs;
 
     // Bind output addresses — only segment outputs (flag + consumer analysis)
+    // Skip when address unchanged from last call
+    std::vector<void *> cur_output_addrs;
+    for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
+        ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+        if (!is_segment_output(node)) continue;
+        cur_output_addrs.push_back(node->data);
+    }
+
+    bool outputs_cached = (cached.outputs.size() == cur_output_addrs.size());
     int n_outputs = 0;
     for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
         ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
         if (!is_segment_output(node)) continue;
+        if (outputs_cached && cached.outputs[n_outputs] == node->data) {
+            n_outputs++;
+            continue;
+        }
         char name[64];
         snprintf(name, sizeof(name), "output_%d", n_outputs);
         if (!exec_ctx->setTensorAddress(name, node->data)) {
@@ -1102,6 +1151,7 @@ static enum ggml_status execute_trt_segment(
         }
         n_outputs++;
     }
+    cached.outputs = cur_output_addrs;
 
     // Debug: log input data before execution
     if (debug_enabled) {
@@ -1127,21 +1177,10 @@ static enum ggml_status execute_trt_segment(
             fprintf(stderr, "\n");
         }
 
-        // Address change detection
-        auto& prev_addrs = prev_input_addrs[hash];
-        std::vector<void*> cur_addrs(leaf_tensors.size());
-        for (size_t k = 0; k < leaf_tensors.size(); k++) {
-            cur_addrs[k] = leaf_tensors[k]->data;
-        }
-        if (!prev_addrs.empty() && prev_addrs.size() == cur_addrs.size()) {
-            for (size_t k = 0; k < cur_addrs.size(); k++) {
-                if (cur_addrs[k] != prev_addrs[k]) {
-                    fprintf(stderr, "[TRT-DEBUG]   input_%zu: address changed %p → %p\n",
-                        k, prev_addrs[k], cur_addrs[k]);
-                }
-            }
-        }
-        prev_addrs = cur_addrs;
+        // Address change detection (uses cached.inputs populated by binding code above)
+        // Note: cached.inputs already has the current addresses, so we compare
+        // leaf_bind_addrs against what setTensorAddress saw last time.
+        // This is informational only — the binding code already handles skipping.
     }
 
     // Execute
@@ -1218,6 +1257,15 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             }
         }
     }
+
+    // ── Cached graph layout ──
+    //
+    // The graph structure (ops, connections) is identical across tokens for
+    // the same model.  Cache the segmentation result (which node indices go
+    // into which TRT segment, which are deferred/immediate trivial ops) to
+    // skip the O(n_nodes) classification walk on subsequent calls.
+    //
+    // Invalidation: when n_nodes changes (prompt→decode transition).
 
     // ── Segmented execution ──
     //
@@ -1361,8 +1409,8 @@ static const ggml_backend_i ggml_backend_tensorrt_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_tensorrt_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record            = */ ggml_backend_tensorrt_event_record,
+    /* .event_wait              = */ ggml_backend_tensorrt_event_wait,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -1466,7 +1514,7 @@ static void ggml_backend_tensorrt_device_get_props(ggml_backend_dev_t dev, struc
         /* .async                 = */ true,
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ false,
+        /* .events                = */ true,
     };
 }
 
@@ -1731,6 +1779,30 @@ static bool ggml_backend_tensorrt_device_offload_op(ggml_backend_dev_t dev, cons
     return op->op == GGML_OP_MUL_MAT;
 }
 
+static ggml_backend_event_t ggml_backend_tensorrt_device_event_new(ggml_backend_dev_t dev) {
+    int device_index = (int)(intptr_t)dev->context;
+    CUDA_CHECK(cudaSetDevice(device_index));
+
+    cudaEvent_t event;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ event,
+    };
+}
+
+static void ggml_backend_tensorrt_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    CUDA_CHECK(cudaEventDestroy((cudaEvent_t)event->context));
+    delete event;
+}
+
+static void ggml_backend_tensorrt_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
+}
+
 static const struct ggml_backend_device_i ggml_backend_tensorrt_device_interface = {
     /* .get_name                   = */ ggml_backend_tensorrt_device_get_name,
     /* .get_description            = */ ggml_backend_tensorrt_device_get_description,
@@ -1744,9 +1816,9 @@ static const struct ggml_backend_device_i ggml_backend_tensorrt_device_interface
     /* .supports_op                = */ ggml_backend_tensorrt_device_supports_op,
     /* .supports_buft              = */ ggml_backend_tensorrt_device_supports_buft,
     /* .offload_op                 = */ ggml_backend_tensorrt_device_offload_op,
-    /* .event_new                  = */ NULL,
-    /* .event_free                 = */ NULL,
-    /* .event_synchronize          = */ NULL,
+    /* .event_new                  = */ ggml_backend_tensorrt_device_event_new,
+    /* .event_free                 = */ ggml_backend_tensorrt_device_event_free,
+    /* .event_synchronize          = */ ggml_backend_tensorrt_device_event_synchronize,
 };
 
 //

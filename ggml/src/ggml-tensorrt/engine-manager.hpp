@@ -5,7 +5,7 @@
 #include <NvInfer.h>
 #include <cstdint>
 #include <memory>
-#include <map>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -116,10 +116,10 @@ private:
     nvinfer1::ILogger* logger_;
 
     // Engine cache: hash -> engine
-    std::map<uint64_t, std::unique_ptr<nvinfer1::ICudaEngine>> engine_cache_;
+    std::unordered_map<uint64_t, std::unique_ptr<nvinfer1::ICudaEngine>> engine_cache_;
 
     // Execution context cache: hash -> context (reusable after rebinding addresses)
-    std::map<uint64_t, std::unique_ptr<nvinfer1::IExecutionContext>> context_cache_;
+    std::unordered_map<uint64_t, std::unique_ptr<nvinfer1::IExecutionContext>> context_cache_;
 
 public:
     // Helper: Configure builder with the given config
