@@ -502,10 +502,17 @@ static int64_t get_kv_cache_max_dim(const ggml_tensor * leaf) {
 
 // Build optimization profiles for dynamic input shapes.
 //
-// KV cache leaves use the exact upper bound from the base buffer's
-// allocation size (kv_size), eliminating all profile-overflow rebuilds.
-// Non-KV leaves use actual*4 capped by dim0_cap (inversely proportional
-// to the largest weight dimension, preventing builder OOM on logits).
+// All dynamic dim0 values in a segment represent token/batch counts
+// bounded by the same context length.  If any leaf is a KV cache view,
+// its base buffer's kv_size is the exact upper bound for ALL dynamic
+// inputs — no dynamic dim can exceed the context length.  Using a
+// single max for all dynamic inputs eliminates profile-overflow rebuilds
+// and avoids TRT "Profile kMAX not self-consistent" warnings (all
+// dynamic dims are consistent at the MAX profile point).
+//
+// For segments without KV cache (e.g. embed/QKV), fall back to
+// actual*4 capped by dim0_cap (inversely proportional to the largest
+// weight dimension, preventing builder OOM on logits).
 static std::vector<input_profile> build_optimization_profiles(
     const std::vector<const ggml_tensor *> & leaf_tensors,
     const std::unordered_set<const ggml_tensor *> & static_leaf_set,
@@ -514,26 +521,32 @@ static std::vector<input_profile> build_optimization_profiles(
     std::vector<input_profile> profiles;
     if (!has_dynamic_inputs) return profiles;
 
-    // Find the largest dimension across ALL leaves (weights, activations,
-    // caches).  This approximates the "cost factor" per unit of dynamic
-    // dim growth — the intermediate memory for a matmul with a large
-    // weight scales as max_leaf_dim × max_dynamic_dim0 × sizeof(float).
-    int64_t max_weight_dim = 1;
+    // Scan for KV cache leaves to find the segment's context bound.
+    // If any dynamic leaf is a KV cache view, kv_size is the exact
+    // upper bound for ALL dynamic dims in this segment.
+    int64_t segment_kv_size = 0;
     for (const auto * leaf : leaf_tensors) {
-        for (int d = 0; d < GGML_MAX_DIMS; d++) {
-            if (leaf->ne[d] > max_weight_dim) {
-                max_weight_dim = leaf->ne[d];
-            }
-        }
+        if (static_leaf_set.count(leaf)) continue;
+        int64_t kv = get_kv_cache_max_dim(leaf);
+        if (kv > segment_kv_size) segment_kv_size = kv;
     }
 
-    // Budget: cap the estimated largest intermediate tensor during build.
-    // With ~10 live intermediates in a 29-node segment, 128 MB each keeps
-    // total builder memory around 1-2 GB — well within typical free VRAM.
-    const int64_t build_budget_bytes = 128LL * 1024 * 1024;
-    int64_t dim0_cap = build_budget_bytes / (max_weight_dim * (int64_t)sizeof(float));
-    if (dim0_cap < 4) dim0_cap = 4;
-    if (dim0_cap > 4096) dim0_cap = 4096;
+    // Fallback for segments without KV cache: cap based on memory budget.
+    int64_t dim0_cap = 0;
+    if (segment_kv_size == 0) {
+        int64_t max_weight_dim = 1;
+        for (const auto * leaf : leaf_tensors) {
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                if (leaf->ne[d] > max_weight_dim) {
+                    max_weight_dim = leaf->ne[d];
+                }
+            }
+        }
+        const int64_t build_budget_bytes = 128LL * 1024 * 1024;
+        dim0_cap = build_budget_bytes / (max_weight_dim * (int64_t)sizeof(float));
+        if (dim0_cap < 4) dim0_cap = 4;
+        if (dim0_cap > 4096) dim0_cap = 4096;
+    }
 
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
         char name[64];
@@ -557,15 +570,12 @@ static std::vector<input_profile> build_optimization_profiles(
             p.max_dims = actual;
             p.min_dims.d[0] = 1;
 
-            // KV cache leaves: use the base buffer's kv_size as the exact
-            // upper bound.  The KV cache can never exceed this — it's the
-            // allocation size.  This eliminates all profile-overflow rebuilds.
-            // Non-KV leaves: use actual*4 capped by dim0_cap (heuristic).
-            int64_t kv_max = get_kv_cache_max_dim(leaf_tensors[k]);
             int64_t expanded;
-            if (kv_max > 0) {
-                expanded = kv_max;
+            if (segment_kv_size > 0) {
+                // KV cache found: use kv_size for ALL dynamic inputs.
+                expanded = segment_kv_size;
             } else {
+                // No KV cache: heuristic with memory budget cap.
                 expanded = actual.d[0] * 4;
                 if (expanded < 16) expanded = 16;
                 if (expanded > dim0_cap) expanded = dim0_cap;
@@ -728,8 +738,8 @@ static nvinfer1::ICudaEngine * build_trt_engine(
     }
 
     // Build optimization profiles for dynamic inputs.
-    // KV cache leaves use the base buffer's kv_size as the exact upper bound.
-    // Non-KV leaves use actual*4 capped by dim0_cap.
+    // If any leaf is a KV cache view, kv_size is used as the max for ALL
+    // dynamic inputs (they share the same context-length bound).
     std::vector<input_profile> profiles = build_optimization_profiles(
         leaf_tensors, static_leaf_set, has_dynamic_inputs);
 
@@ -746,27 +756,14 @@ static nvinfer1::ICudaEngine * build_trt_engine(
             }
         }
 
-        // Compute dim0_cap and max_weight_dim for logging (same logic as profiles)
-        int64_t max_weight_dim = 1;
-        for (const auto * leaf : leaf_tensors) {
-            for (int d = 0; d < GGML_MAX_DIMS; d++) {
-                if (leaf->ne[d] > max_weight_dim) max_weight_dim = leaf->ne[d];
-            }
-        }
-        const int64_t build_budget_bytes = 128LL * 1024 * 1024;
-        int64_t dim0_cap = build_budget_bytes / (max_weight_dim * (int64_t)sizeof(float));
-        if (dim0_cap < 4) dim0_cap = 4;
-        if (dim0_cap > 4096) dim0_cap = 4096;
-
         GGML_LOG_DEBUG("%s: building engine (segment %" PRId64 ", hash 0x%016" PRIx64
             ", %zu nodes, %zu leaves [%zu static, %zu dynamic], "
             "workspace %zu MB, GPU free %zu MB / %zu MB, "
-            "dynamic=%s, dim0_cap=%" PRId64 ", max_weight_dim=%" PRId64
-            ", max_dyn_dim0=%" PRId64 ")\n",
+            "dynamic=%s, max_dyn_dim0=%" PRId64 ")\n",
             __func__, segment_id, hash, trt_node_indices.size(), leaf_tensors.size(),
             static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size(),
             engine_config.max_workspace_size >> 20, free_bytes >> 20, total_bytes >> 20,
-            has_dynamic_inputs ? "yes" : "no", dim0_cap, max_weight_dim, max_dyn_dim0);
+            has_dynamic_inputs ? "yes" : "no", max_dyn_dim0);
     }
 
     nvinfer1::ICudaEngine * engine = nullptr;
