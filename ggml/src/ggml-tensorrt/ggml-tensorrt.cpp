@@ -802,8 +802,7 @@ static bool reclassify_mismatched_leaves(
     uint64_t hash,
     const std::vector<const ggml_tensor *> & leaf_tensors,
     std::unordered_set<const ggml_tensor *> & static_leaf_set,
-    bool & has_dynamic_inputs,
-    bool & enable_cuda_graphs
+    bool & has_dynamic_inputs
 ) {
     nvinfer1::ICudaEngine * engine = ctx->engine_mgr->get_cached_engine(hash);
     if (!engine) return false;
@@ -826,7 +825,6 @@ static bool reclassify_mismatched_leaves(
             if (!match) {
                 static_leaf_set.erase(leaf_tensors[k]);
                 has_dynamic_inputs = true;
-                enable_cuda_graphs = false;
                 needs_rebuild = true;
             }
         } else {
@@ -967,11 +965,10 @@ static enum ggml_status execute_trt_segment(
     //      engine's optimization profile max.
     // Both cases evict the stale engine and rebuild before TRT ever
     // sees the incompatible shapes — no TRT ERROR messages.
-    bool enable_cuda_graphs = !has_dynamic_inputs;
     if (engine != nullptr) {
         bool needs_rebuild = reclassify_mismatched_leaves(
             ctx, hash, leaf_tensors, static_leaf_set,
-            has_dynamic_inputs, enable_cuda_graphs);
+            has_dynamic_inputs);
         if (needs_rebuild) {
             GGML_LOG_WARN("%s: shape/profile mismatch for segment %" PRId64
                 ", rebuilding (%zu static, %zu dynamic)\n", __func__, segment_id,
@@ -979,7 +976,6 @@ static enum ggml_status execute_trt_segment(
             ctx->engine_mgr->evict_engine(hash);
             hash = compute_graph_hash(cgraph, trt_node_indices, static_leaf_set);
             engine = ctx->engine_mgr->get_cached_engine(hash);
-            enable_cuda_graphs = !has_dynamic_inputs;
         }
     }
 
@@ -994,7 +990,11 @@ static enum ggml_status execute_trt_segment(
     }
 
     // ── Execution context + input shapes ──
-    nvinfer1::IExecutionContext * exec_ctx = ctx->engine_mgr->get_or_create_context(hash, enable_cuda_graphs);
+    // TRT-RTX 1.3 handles CUDA graphs with dynamic shapes natively via
+    // kWHOLE_GRAPH_CAPTURE — it captures after shape-specialized kernel
+    // compilation and re-captures on shape changes.  get_or_create_context()
+    // falls back to a plain context if CUDA graph capture fails.
+    nvinfer1::IExecutionContext * exec_ctx = ctx->engine_mgr->get_or_create_context(hash, /*enable_cuda_graphs=*/true);
     if (!exec_ctx) {
         GGML_LOG_ERROR("%s: failed to get execution context\n", __func__);
         return GGML_STATUS_FAILED;
