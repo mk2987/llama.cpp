@@ -122,11 +122,6 @@ private:
     std::map<uint64_t, std::unique_ptr<nvinfer1::IExecutionContext>> context_cache_;
 
 public:
-    // Previous profile dim0 max per engine hash.  Used for amortized
-    // doubling: on profile overflow, the new max is at least 2× the old
-    // max, reducing rebuilds from O(N) to O(log N) as KV cache grows.
-    std::map<uint64_t, int64_t> prev_profile_dim0_max;
-
     // Helper: Configure builder with the given config
     void configure_builder(
         nvinfer1::IBuilder* builder,

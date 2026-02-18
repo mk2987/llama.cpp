@@ -479,23 +479,37 @@ static std::vector<float> debug_read_tensor_head(const ggml_tensor * tensor, cud
     return result;
 }
 
+// Check if a leaf tensor is a VIEW of a KV cache buffer.
+// Returns the kv_size (src[0]->ne[1]) if so, or 0 if not.
+// KV cache VIEWs are partial views with op=VIEW and src[0] named
+// "cache_k_l*" or "cache_v_l*".  The base buffer's ne[1] is the max
+// context length (kv_size) — the KV cache can never exceed this.
+static int64_t get_kv_cache_max_dim(const ggml_tensor * leaf) {
+    // Case 1: leaf IS the KV cache base buffer (op=NONE, name match)
+    if (leaf->op == GGML_OP_NONE &&
+        (strncmp(leaf->name, "cache_k_l", 9) == 0 ||
+         strncmp(leaf->name, "cache_v_l", 9) == 0)) {
+        return leaf->ne[1];
+    }
+    // Case 2: leaf is a VIEW of the KV cache (op=VIEW, src[0] is the buffer)
+    if (leaf->op == GGML_OP_VIEW && leaf->src[0] &&
+        (strncmp(leaf->src[0]->name, "cache_k_l", 9) == 0 ||
+         strncmp(leaf->src[0]->name, "cache_v_l", 9) == 0)) {
+        return leaf->src[0]->ne[1];
+    }
+    return 0;
+}
+
 // Build optimization profiles for dynamic input shapes.
 //
-// The key constraint: TRT's builder allocates intermediate buffers at
-// the MAX profile dimensions during tactic profiling.  For segments
-// containing a MUL_MAT with large weight matrices (e.g. n_vocab=262K),
-// the intermediate size is approximately:
-//   max_weight_dim × max_dynamic_dim0 × sizeof(float)
-//
-// We scale max_dynamic_dim0 inversely with the largest weight dimension
-// so this product stays within a memory budget.  This naturally gives
-// generous ranges for regular transformer layers (weight dims ~6K)
-// and tight ranges for the logits segment (weight dim = n_vocab).
+// KV cache leaves use the exact upper bound from the base buffer's
+// allocation size (kv_size), eliminating all profile-overflow rebuilds.
+// Non-KV leaves use actual*4 capped by dim0_cap (inversely proportional
+// to the largest weight dimension, preventing builder OOM on logits).
 static std::vector<input_profile> build_optimization_profiles(
     const std::vector<const ggml_tensor *> & leaf_tensors,
     const std::unordered_set<const ggml_tensor *> & static_leaf_set,
-    bool has_dynamic_inputs,
-    int64_t prev_dim0_max
+    bool has_dynamic_inputs
 ) {
     std::vector<input_profile> profiles;
     if (!has_dynamic_inputs) return profiles;
@@ -543,14 +557,14 @@ static std::vector<input_profile> build_optimization_profiles(
             p.max_dims = actual;
             p.min_dims.d[0] = 1;
 
-            // Amortized doubling: on first build, use actual*4 capped by
-            // dim0_cap.  On rebuilds (prev_dim0_max > 0), double the
-            // previous max.  This gives O(log N) rebuilds as the KV cache
-            // grows, even for segments where dim0_cap is tight (e.g. the
-            // logits segment with vocab=262K weights).
+            // KV cache leaves: use the base buffer's kv_size as the exact
+            // upper bound.  The KV cache can never exceed this — it's the
+            // allocation size.  This eliminates all profile-overflow rebuilds.
+            // Non-KV leaves: use actual*4 capped by dim0_cap (heuristic).
+            int64_t kv_max = get_kv_cache_max_dim(leaf_tensors[k]);
             int64_t expanded;
-            if (prev_dim0_max > 0) {
-                expanded = prev_dim0_max * 2;
+            if (kv_max > 0) {
+                expanded = kv_max;
             } else {
                 expanded = actual.d[0] * 4;
                 if (expanded < 16) expanded = 16;
@@ -692,9 +706,8 @@ static nvinfer1::ICudaEngine * build_trt_engine(
     } else {
         // Scale workspace with available VRAM: use 1/4 of free memory,
         // clamped to [64 MB, 4 GB].  This gives large GPUs enough
-        // workspace for wide optimization profiles (e.g. logits with
-        // vocab=262K × doubled dim0) while staying conservative on
-        // small GPUs where VRAM is tight.
+        // workspace for wide optimization profiles while staying
+        // conservative on small GPUs where VRAM is tight.
         size_t free_bytes = 0, total_bytes = 0;
         cudaMemGetInfo(&free_bytes, &total_bytes);
         engine_config.max_workspace_size = free_bytes / 4;
@@ -715,16 +728,10 @@ static nvinfer1::ICudaEngine * build_trt_engine(
     }
 
     // Build optimization profiles for dynamic inputs.
-    // Amortized doubling: look up the previous profile max for this hash.
-    // On first build it's 0 (use default 4× heuristic).  On rebuilds
-    // after profile overflow, it doubles the previous max.
-    int64_t prev_dim0_max = 0;
-    auto prev_it = ctx->engine_mgr->prev_profile_dim0_max.find(hash);
-    if (prev_it != ctx->engine_mgr->prev_profile_dim0_max.end()) {
-        prev_dim0_max = prev_it->second;
-    }
+    // KV cache leaves use the base buffer's kv_size as the exact upper bound.
+    // Non-KV leaves use actual*4 capped by dim0_cap.
     std::vector<input_profile> profiles = build_optimization_profiles(
-        leaf_tensors, static_leaf_set, has_dynamic_inputs, prev_dim0_max);
+        leaf_tensors, static_leaf_set, has_dynamic_inputs);
 
     // Diagnostic: log build details and VRAM state
     {
@@ -765,58 +772,6 @@ static nvinfer1::ICudaEngine * build_trt_engine(
     nvinfer1::ICudaEngine * engine = nullptr;
     if (has_dynamic_inputs) {
         engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config, profiles);
-
-        // If the build failed (likely OOM from amortized doubling making the
-        // profile too wide), retry with profiles clamped to actual dims.
-        // This gives zero headroom (next growth will rebuild) but avoids a
-        // fatal OOM crash.
-        if (!engine) {
-            int64_t failed_max = 0;
-            for (size_t k = 0; k < profiles.size(); k++) {
-                if (k < leaf_tensors.size() && !static_leaf_set.count(leaf_tensors[k])) {
-                    if (profiles[k].max_dims.d[0] > failed_max) {
-                        failed_max = profiles[k].max_dims.d[0];
-                    }
-                }
-            }
-            GGML_LOG_WARN("%s: build OOM with profile dim0_max=%" PRId64 ", workspace=%zu MB, "
-                "retrying with actual dims (segment %" PRId64 ")\n",
-                __func__, failed_max, engine_config.max_workspace_size >> 20, segment_id);
-            for (size_t k = 0; k < profiles.size(); k++) {
-                if (k < leaf_tensors.size() && !static_leaf_set.count(leaf_tensors[k])) {
-                    nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
-                    profiles[k].max_dims.d[0] = actual.d[0];
-                }
-            }
-            // Need fresh builder/network since TRT may have corrupted state.
-            // Destroy network BEFORE builder (network references builder internals).
-            network.reset();
-            builder.reset(nvinfer1::createInferBuilder(*ctx->logger));
-            network.reset(builder ? builder->createNetworkV2(explicit_batch) : nullptr);
-            if (builder && network) {
-                NetworkBuilder retry_builder(network.get(), ctx->logger);
-                for (size_t k = 0; k < leaf_tensors.size(); k++) {
-                    char name[64];
-                    snprintf(name, sizeof(name), "input_%zu", k);
-                    bool is_dynamic = !static_leaf_set.count(leaf_tensors[k]);
-                    retry_builder.add_input(leaf_tensors[k], name, is_dynamic);
-                }
-                int retry_out_idx = 0;
-                for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
-                    ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
-                    nvinfer1::ITensor * output = retry_builder.add_operation(node);
-                    if (output && is_segment_output(node)) {
-                        nvinfer1::DataType expected_type = ggml_type_to_tensorrt(node->type);
-                        output = retry_builder.maybe_cast(output, expected_type);
-                        char out_name[64];
-                        snprintf(out_name, sizeof(out_name), "output_%d", retry_out_idx);
-                        retry_builder.mark_output(output, out_name);
-                        retry_out_idx++;
-                    }
-                }
-                engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config, profiles);
-            }
-        }
     } else {
         engine = ctx->engine_mgr->build_engine(builder.get(), network.get(), engine_config);
     }
@@ -830,19 +785,6 @@ static nvinfer1::ICudaEngine * build_trt_engine(
     }
 
     ctx->engine_mgr->cache_engine(hash, engine);
-
-    // Record the profile dim0 max for amortized doubling on future rebuilds
-    if (has_dynamic_inputs) {
-        int64_t max_dim0 = 0;
-        for (size_t k = 0; k < profiles.size(); k++) {
-            if (k < leaf_tensors.size() && !static_leaf_set.count(leaf_tensors[k])) {
-                if (profiles[k].max_dims.d[0] > max_dim0) {
-                    max_dim0 = profiles[k].max_dims.d[0];
-                }
-            }
-        }
-        ctx->engine_mgr->prev_profile_dim0_max[hash] = max_dim0;
-    }
 
     return engine;
 }
