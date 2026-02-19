@@ -14,6 +14,16 @@
 #include <limits>
 #include <stdexcept>
 
+// NVTX markers for Nsight Systems profiling (no-op if NVTX unavailable)
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define LLAMA_NVTX_PUSH(name) nvtxRangePushA(name)
+#define LLAMA_NVTX_POP()      nvtxRangePop()
+#else
+#define LLAMA_NVTX_PUSH(name)
+#define LLAMA_NVTX_POP()
+#endif
+
 //
 // llama_context
 //
@@ -1118,9 +1128,11 @@ bool llama_context::apply_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    LLAMA_NVTX_PUSH(ubatch.n_tokens > 1 ? "prompt" : "decode");
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
+        LLAMA_NVTX_POP();
         return nullptr;
     }
 
@@ -1150,12 +1162,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
+            LLAMA_NVTX_POP();
             return nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
+            LLAMA_NVTX_POP();
             return nullptr;
         }
     }
@@ -1173,11 +1187,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
+        LLAMA_NVTX_POP();
         return nullptr;
     }
 
     ret = GGML_STATUS_SUCCESS;
 
+    LLAMA_NVTX_POP();  // prompt / decode
     return res;
 }
 

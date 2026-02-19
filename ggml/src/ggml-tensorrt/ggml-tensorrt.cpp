@@ -12,6 +12,7 @@
 #endif
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 #include <NvInfer.h>
 #include <cassert>
 #include <chrono>
@@ -1000,9 +1001,11 @@ static enum ggml_status execute_trt_segment(
 
     // ── Build engine (cache miss or post-reclassification) ──
     if (engine == nullptr) {
+        nvtxRangePushA("TRT engine build");
         engine = build_trt_engine(ctx, cgraph, trt_node_indices, leaf_tensors,
                                   static_leaf_set, has_dynamic_inputs,
                                   is_segment_output, segment_id, hash);
+        nvtxRangePop();
         if (!engine) {
             return GGML_STATUS_FAILED;
         }
@@ -1184,7 +1187,10 @@ static enum ggml_status execute_trt_segment(
     }
 
     // Execute
-    if (!exec_ctx->enqueueV3(ctx->stream)) {
+    nvtxRangePushA("TRT enqueueV3");
+    bool enqueue_ok = exec_ctx->enqueueV3(ctx->stream);
+    nvtxRangePop();
+    if (!enqueue_ok) {
         GGML_LOG_ERROR("%s: failed to execute TensorRT engine (segment %" PRId64 ")\n", __func__, segment_id);
         return GGML_STATUS_FAILED;
     }
@@ -1219,6 +1225,7 @@ static enum ggml_status execute_trt_segment(
 }
 
 static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    nvtxRangePushA("TRT graph_compute");
     ggml_backend_tensorrt_context * ctx = (ggml_backend_tensorrt_context *) backend->context;
 
     CUDA_CHECK(cudaSetDevice(ctx->device));
@@ -1296,10 +1303,16 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         }
         // Execute deferred trivial ops (SET_ROWS) — their inputs are now
         // produced by the TRT engine we just ran.
+        if (!pending_trivial.empty()) {
+            nvtxRangePushA("TRT SET_ROWS");
+        }
         for (ggml_tensor * node : pending_trivial) {
             if (node->op == GGML_OP_SET_ROWS) {
                 ggml_tensorrt_set_rows(node->src[0], node->src[1], node, ctx->stream);
             }
+        }
+        if (!pending_trivial.empty()) {
+            nvtxRangePop();
         }
         seg_trt_indices.clear();
         seg_trt_set.clear();
@@ -1394,6 +1407,7 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
             ctx->engine_mgr->total_build_time_ms);
     }
 
+    nvtxRangePop();  // TRT graph_compute
     return final_status;
 }
 
