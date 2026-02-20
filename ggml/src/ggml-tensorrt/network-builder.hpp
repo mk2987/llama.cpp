@@ -177,6 +177,9 @@ nvinfer1::ITensor* handle_glu(NetworkBuilder* builder, const ggml_tensor* node);
 // Rotary position embedding (ROPE)
 nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node);
 
+// SET_ROWS → IKVCacheUpdateLayer (native attention path)
+nvinfer1::ITensor* handle_set_rows(NetworkBuilder* builder, const ggml_tensor* node);
+
 // Shared activation helper — applies an activation function to a TRT tensor.
 // Used by both unary ops and GLU.  Returns nullptr on failure.
 // Supported activations: SILU, GELU, GELU_ERF, RELU, TANH, SIGMOID, EXP, GELU_QUICK

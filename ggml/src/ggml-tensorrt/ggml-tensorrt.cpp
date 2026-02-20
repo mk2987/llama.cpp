@@ -369,10 +369,20 @@ static bool is_walkthrough_op(ggml_op op) {
     return is_shape_op(op) || op == GGML_OP_CPY || op == GGML_OP_DUP || op == GGML_OP_CONT;
 }
 
+// When GGML_TENSORRT_NATIVE_ATTN=1, SET_ROWS targeting KV cache buffers is
+// built into the TRT engine via IKVCacheUpdateLayer instead of being executed
+// as a standalone CUDA kernel.  This eliminates the segment flush that
+// SET_ROWS causes (2 flushes per layer × 26 layers = 52 GPU bubbles/pass).
+static const bool native_attn_enabled = (getenv("GGML_TENSORRT_NATIVE_ATTN") != nullptr
+                                          && atoi(getenv("GGML_TENSORRT_NATIVE_ATTN")) != 0);
+
 // Check if an op is a trivial CUDA op executed outside the TRT engine.
 // These are handled directly by custom CUDA kernels in graph_compute.
 static bool is_trivial_op(ggml_op op) {
-    return op == GGML_OP_SET_ROWS;
+    if (op == GGML_OP_SET_ROWS) {
+        return !native_attn_enabled;
+    }
+    return false;
 }
 
 // Check if a tensor's op is TRT-compatible (built into the TRT engine).
@@ -527,6 +537,7 @@ static int64_t get_kv_cache_max_dim(const ggml_tensor * leaf) {
 static std::vector<input_profile> build_optimization_profiles(
     const std::vector<const ggml_tensor *> & leaf_tensors,
     const std::unordered_set<const ggml_tensor *> & static_leaf_set,
+    const std::unordered_set<const ggml_tensor *> & skip_profile_leaves,
     bool has_dynamic_inputs
 ) {
     std::vector<input_profile> profiles;
@@ -560,6 +571,10 @@ static std::vector<input_profile> build_optimization_profiles(
     }
 
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
+        // Skip leaves added with non-standard shapes (e.g. 4D KV cache).
+        // Their dims are fully static and don't need profile entries.
+        if (skip_profile_leaves.count(leaf_tensors[k])) continue;
+
         char name[64];
         snprintf(name, sizeof(name), "input_%zu", k);
         nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
@@ -609,6 +624,7 @@ static nvinfer1::ICudaEngine * build_trt_engine(
     const std::vector<int> & trt_node_indices,
     const std::vector<const ggml_tensor *> & leaf_tensors,
     const std::unordered_set<const ggml_tensor *> & static_leaf_set,
+    const std::unordered_set<const ggml_tensor *> & kv_cache_leaves,
     bool has_dynamic_inputs,
     const std::function<bool(const ggml_tensor *)> & is_segment_output,
     int64_t segment_id,
@@ -678,13 +694,40 @@ static nvinfer1::ICudaEngine * build_trt_engine(
 
     // Add leaf tensors as inputs with positional names.
     // Dynamic leaves get wildcard dims (-1); static leaves get concrete dims.
+    // KV cache dest leaves are added as 4D [1, 1, kv_size, n_embd_gqa] so
+    // IKVCacheUpdateLayer gets a direct network input with static maxSeqLen.
+    // numHeads=1 keeps the memory layout identical to GGML's 2D
+    // [n_embd_gqa, kv_size] — no transpose needed.
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
         char name[64];
         snprintf(name, sizeof(name), "input_%zu", k);
-        bool is_dynamic = !static_leaf_set.count(leaf_tensors[k]);
-        if (!net_builder.add_input(leaf_tensors[k], name, is_dynamic)) {
-            GGML_LOG_ERROR("%s: failed to add input tensor input_%zu\n", __func__, k);
-            return nullptr;
+
+        if (kv_cache_leaves.count(leaf_tensors[k])) {
+            // 4D input: [1, 1, kv_size, n_embd_gqa]
+            const ggml_tensor * leaf = leaf_tensors[k];
+            int64_t n_embd_gqa_k = leaf->ne[0];
+            int64_t kv_size_k    = leaf->ne[1];
+
+            nvinfer1::Dims dims4;
+            dims4.nbDims = 4;
+            dims4.d[0] = 1;                       // batchSize
+            dims4.d[1] = 1;                        // numHeads (flat — preserves memory layout)
+            dims4.d[2] = (int32_t)kv_size_k;       // maxSeqLen (static)
+            dims4.d[3] = (int32_t)n_embd_gqa_k;    // headSize = full embedding
+
+            nvinfer1::DataType dtype = ggml_type_to_tensorrt(leaf->type);
+            nvinfer1::ITensor* inp = net_builder.get_network()->addInput(name, dtype, dims4);
+            if (!inp) {
+                GGML_LOG_ERROR("%s: failed to add 4D KV cache input %s\n", __func__, name);
+                return nullptr;
+            }
+            net_builder.set_tensor(leaf, inp);
+        } else {
+            bool is_dynamic = !static_leaf_set.count(leaf_tensors[k]);
+            if (!net_builder.add_input(leaf_tensors[k], name, is_dynamic)) {
+                GGML_LOG_ERROR("%s: failed to add input tensor %s\n", __func__, name);
+                return nullptr;
+            }
         }
     }
 
@@ -752,7 +795,7 @@ static nvinfer1::ICudaEngine * build_trt_engine(
     // If any leaf is a KV cache view, kv_size is used as the max for ALL
     // dynamic inputs (they share the same context-length bound).
     std::vector<input_profile> profiles = build_optimization_profiles(
-        leaf_tensors, static_leaf_set, has_dynamic_inputs);
+        leaf_tensors, static_leaf_set, kv_cache_leaves, has_dynamic_inputs);
 
     // Diagnostic: log build details and VRAM state
     {
@@ -947,16 +990,35 @@ static enum ggml_status execute_trt_segment(
         return false;
     };
 
+    // ── Identify KV cache destination leaves ──
+    //
+    // When native attention is enabled, SET_ROWS nodes are TRT ops.  Their
+    // src[2] is the KV cache buffer, which becomes a leaf input.  These
+    // leaves are added as 4D inputs [1, 1, kv_size, n_embd_gqa] (numHeads=1,
+    // treating the full embedding as headSize to match GGML's memory layout).
+    // All 4D dims are static, so we classify them as static for profiling.
+    std::unordered_set<const ggml_tensor *> kv_cache_leaves;
+    if (native_attn_enabled) {
+        for (int idx : trt_node_indices) {
+            const ggml_tensor * n = cgraph->nodes[idx];
+            if (n->op == GGML_OP_SET_ROWS && n->src[2] != nullptr) {
+                kv_cache_leaves.insert(n->src[2]);
+            }
+        }
+    }
+
     // ── Classify leaves as static (weights) or dynamic (activations) ──
     //
     // Static leaves have constant shapes across all calls (model weights,
     // normalization scales).  Dynamic leaves have batch/token dims that change
     // between prompt and decode (hidden states, position IDs, KV views).
+    // KV cache dest leaves used by IKVCacheUpdateLayer have all-static 4D
+    // dims (kv_size is fixed at allocation), so they're classified as static.
 
     std::unordered_set<const ggml_tensor *> static_leaf_set;
     bool has_dynamic_inputs = false;
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
-        if (is_static_leaf(leaf_tensors[k])) {
+        if (is_static_leaf(leaf_tensors[k]) || kv_cache_leaves.count(leaf_tensors[k])) {
             static_leaf_set.insert(leaf_tensors[k]);
         } else {
             has_dynamic_inputs = true;
@@ -1004,7 +1066,7 @@ static enum ggml_status execute_trt_segment(
     if (engine == nullptr) {
         nvtxRangePushA("TRT engine build");
         engine = build_trt_engine(ctx, cgraph, trt_node_indices, leaf_tensors,
-                                  static_leaf_set, has_dynamic_inputs,
+                                  static_leaf_set, kv_cache_leaves, has_dynamic_inputs,
                                   is_segment_output, segment_id, hash);
         nvtxRangePop();
         if (!engine) {
@@ -1088,10 +1150,24 @@ static enum ggml_status execute_trt_segment(
         }
     }
 
+    // Intentional I/O aliases from IKVCacheUpdateLayer: the SET_ROWS output
+    // is a view of the cache buffer (same address).  These must NOT be
+    // copied to scratch — the output must write back to cache in-place.
+    std::unordered_set<void *> intentional_alias_addrs;
+    for (int idx : trt_node_indices) {
+        ggml_tensor * node = cgraph->nodes[idx];
+        if (node->op == GGML_OP_SET_ROWS && node->src[2] != nullptr &&
+            kv_cache_leaves.count(node->src[2])) {
+            intentional_alias_addrs.insert(node->src[2]->data);
+        }
+    }
+
     // Pre-compute total scratch needed for all I/O aliases
+    // (excluding intentional aliases from IKVCacheUpdateLayer)
     size_t total_scratch = 0;
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
-        if (output_addrs.count(leaf_tensors[k]->data)) {
+        if (output_addrs.count(leaf_tensors[k]->data) &&
+            !intentional_alias_addrs.count(leaf_tensors[k]->data)) {
             size_t nbytes = ggml_nbytes(leaf_tensors[k]);
             total_scratch += (nbytes + 255) & ~255;  // match alloc() alignment
         }
@@ -1106,7 +1182,7 @@ static enum ggml_status execute_trt_segment(
     std::vector<void *> leaf_bind_addrs(leaf_tensors.size());
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
         void * addr = leaf_tensors[k]->data;
-        if (output_addrs.count(addr)) {
+        if (output_addrs.count(addr) && !intentional_alias_addrs.count(addr)) {
             size_t nbytes = ggml_nbytes(leaf_tensors[k]);
             void * scratch_addr = (char *)scratch_base + scratch_off;
             scratch_off += (nbytes + 255) & ~255;
