@@ -875,6 +875,7 @@ static enum ggml_status execute_trt_segment(
         nvinfer1::IExecutionContext * ctx = nullptr;
         std::vector<void *> inputs;
         std::vector<void *> outputs;
+        std::vector<nvinfer1::Dims> input_shapes;  // cached setInputShape dims
     };
     static std::unordered_map<uint64_t, addr_cache_entry> prev_addrs;
 
@@ -1012,14 +1013,14 @@ static enum ggml_status execute_trt_segment(
     }
 
     // ── Execution context + input shapes ──
-    // CUDA graphs are only beneficial for static-shape segments (embeddings,
-    // final projection) where the graph is captured once and replayed.
-    // Dynamic segments (KV cache dims change every token) force re-capture
-    // on every forward pass — the capture/update/destroy overhead (~62µs per
-    // segment) exceeds the graph launch benefit.  Direct enqueueV3 is cheaper.
+    // CUDA graphs enabled for all segments (static and dynamic).  Shape caching
+    // above ensures setInputShape is only called when dims actually change,
+    // so TRT captures the graph once per shape transition (prompt→decode) and
+    // replays on all subsequent tokens.  One cudaGraphLaunch (~33µs) replaces
+    // hundreds of individual kernel launches (~7µs each).
     static const bool cuda_graphs_env = (getenv("GGML_TENSORRT_CUDA_GRAPHS") == nullptr ||
                                           atoi(getenv("GGML_TENSORRT_CUDA_GRAPHS")) != 0);
-    bool enable_cuda_graphs = cuda_graphs_env && !has_dynamic_inputs;
+    bool enable_cuda_graphs = cuda_graphs_env;
     nvinfer1::IExecutionContext * exec_ctx = ctx->engine_mgr->get_or_create_context(hash, enable_cuda_graphs);
     if (!exec_ctx) {
         GGML_LOG_ERROR("%s: failed to get execution context\n", __func__);
@@ -1027,16 +1028,34 @@ static enum ggml_status execute_trt_segment(
     }
 
     if (has_dynamic_inputs) {
+        auto & cached = prev_addrs[hash];
+        bool shapes_cached = (cached.input_shapes.size() == leaf_tensors.size());
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
+            nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
+            // Skip setInputShape when dims unchanged — avoids CUDA graph re-capture
+            if (shapes_cached) {
+                const nvinfer1::Dims & prev = cached.input_shapes[k];
+                if (prev.nbDims == actual.nbDims) {
+                    bool equal = true;
+                    for (int d = 0; d < actual.nbDims; d++) {
+                        if (prev.d[d] != actual.d[d]) { equal = false; break; }
+                    }
+                    if (equal) { continue; }
+                }
+            }
             char name[64];
             snprintf(name, sizeof(name), "input_%zu", k);
-            nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
             if (!exec_ctx->setInputShape(name, actual)) {
                 GGML_LOG_ERROR("%s: setInputShape failed for segment %" PRId64
                     " input_%zu (should have been caught by proactive check)\n",
                     __func__, segment_id, k);
                 return GGML_STATUS_FAILED;
             }
+        }
+        // Update cached shapes
+        cached.input_shapes.resize(leaf_tensors.size());
+        for (size_t k = 0; k < leaf_tensors.size(); k++) {
+            cached.input_shapes[k] = ggml_tensor_to_dims(leaf_tensors[k]);
         }
     }
 
@@ -1106,17 +1125,18 @@ static enum ggml_status execute_trt_segment(
     }
 
     // Bind input addresses — skip when address unchanged from last call
-    auto & cached = prev_addrs[hash];
-    if (cached.ctx != exec_ctx) {
+    auto & cached_addrs = prev_addrs[hash];
+    if (cached_addrs.ctx != exec_ctx) {
         // Context changed (new engine build or eviction) — must rebind all
-        cached.inputs.clear();
-        cached.outputs.clear();
-        cached.ctx = exec_ctx;
+        cached_addrs.inputs.clear();
+        cached_addrs.outputs.clear();
+        cached_addrs.input_shapes.clear();
+        cached_addrs.ctx = exec_ctx;
     }
-    bool inputs_cached = (cached.inputs.size() == leaf_tensors.size());
+    bool inputs_cached = (cached_addrs.inputs.size() == leaf_tensors.size());
 
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
-        if (inputs_cached && cached.inputs[k] == leaf_bind_addrs[k]) {
+        if (inputs_cached && cached_addrs.inputs[k] == leaf_bind_addrs[k]) {
             continue;
         }
         char name[64];
@@ -1126,7 +1146,7 @@ static enum ggml_status execute_trt_segment(
             return GGML_STATUS_FAILED;
         }
     }
-    cached.inputs = leaf_bind_addrs;
+    cached_addrs.inputs = leaf_bind_addrs;
 
     // Bind output addresses — only segment outputs (flag + consumer analysis)
     // Skip when address unchanged from last call
@@ -1137,12 +1157,12 @@ static enum ggml_status execute_trt_segment(
         cur_output_addrs.push_back(node->data);
     }
 
-    bool outputs_cached = (cached.outputs.size() == cur_output_addrs.size());
+    bool outputs_cached = (cached_addrs.outputs.size() == cur_output_addrs.size());
     int n_outputs = 0;
     for (size_t ni = 0; ni < trt_node_indices.size(); ni++) {
         ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
         if (!is_segment_output(node)) continue;
-        if (outputs_cached && cached.outputs[n_outputs] == node->data) {
+        if (outputs_cached && cached_addrs.outputs[n_outputs] == node->data) {
             n_outputs++;
             continue;
         }
@@ -1154,7 +1174,7 @@ static enum ggml_status execute_trt_segment(
         }
         n_outputs++;
     }
-    cached.outputs = cur_output_addrs;
+    cached_addrs.outputs = cur_output_addrs;
 
     // Debug: log input data before execution
     if (debug_enabled) {
