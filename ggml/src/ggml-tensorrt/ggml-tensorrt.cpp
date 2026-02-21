@@ -1206,6 +1206,17 @@ static enum ggml_status execute_trt_segment(
         return GGML_STATUS_FAILED;
     }
 
+    // Early context-change detection: if the context was recreated (eviction
+    // + rebuild), the shape cache entries from the old context are stale.
+    // Clear them now so the shape-setting loop below sees an empty cache and
+    // calls setInputShape for ALL inputs on the fresh context.
+    {
+        auto & cached = prev_addrs[hash];
+        if (cached.ctx != exec_ctx) {
+            cached.input_shapes.clear();
+        }
+    }
+
     if (has_dynamic_inputs) {
         // Helper: KV cache leaves are added as 4D [1,1,kv_size,n_embd_gqa],
         // but ggml_tensor_to_dims returns 2D.  Use correct 4D dims for them.
@@ -1224,28 +1235,39 @@ static enum ggml_status execute_trt_segment(
 
         auto & cached = prev_addrs[hash];
         bool shapes_cached = (cached.input_shapes.size() == leaf_tensors.size());
-        for (size_t k = 0; k < leaf_tensors.size(); k++) {
-            nvinfer1::Dims actual = leaf_input_dims(k);
-            // Skip setInputShape when dims unchanged — avoids CUDA graph re-capture
-            if (shapes_cached) {
+
+        // Check if ANY shape changed.  When a shape changes, TRT invalidates
+        // its captured CUDA graph and must recapture.  During recapture TRT
+        // requires setInputShape for ALL profiled inputs — not just the ones
+        // that changed.  So if any shape differs, we must re-set all of them.
+        bool any_shape_changed = !shapes_cached;
+        if (shapes_cached) {
+            for (size_t k = 0; k < leaf_tensors.size() && !any_shape_changed; k++) {
+                nvinfer1::Dims actual = leaf_input_dims(k);
                 const nvinfer1::Dims & prev = cached.input_shapes[k];
-                if (prev.nbDims == actual.nbDims) {
-                    bool equal = true;
-                    for (int d = 0; d < actual.nbDims; d++) {
-                        if (prev.d[d] != actual.d[d]) { equal = false; break; }
-                    }
-                    if (equal) { continue; }
+                if (prev.nbDims != actual.nbDims) { any_shape_changed = true; break; }
+                for (int d = 0; d < actual.nbDims; d++) {
+                    if (prev.d[d] != actual.d[d]) { any_shape_changed = true; break; }
                 }
             }
-            char name[64];
-            snprintf(name, sizeof(name), "input_%zu", k);
-            if (!exec_ctx->setInputShape(name, actual)) {
-                GGML_LOG_ERROR("%s: setInputShape failed for segment %" PRId64
-                    " input_%zu (should have been caught by proactive check)\n",
-                    __func__, segment_id, k);
-                return GGML_STATUS_FAILED;
+        }
+
+        if (any_shape_changed) {
+            // At least one shape differs (or cache is empty) — set ALL shapes
+            for (size_t k = 0; k < leaf_tensors.size(); k++) {
+                nvinfer1::Dims actual = leaf_input_dims(k);
+                char name[64];
+                snprintf(name, sizeof(name), "input_%zu", k);
+                if (!exec_ctx->setInputShape(name, actual)) {
+                    GGML_LOG_ERROR("%s: setInputShape failed for segment %" PRId64
+                        " input_%zu (should have been caught by proactive check)\n",
+                        __func__, segment_id, k);
+                    return GGML_STATUS_FAILED;
+                }
             }
         }
+        // else: all shapes unchanged — skip setInputShape entirely → CUDA graph replay
+
         // Update cached shapes
         cached.input_shapes.resize(leaf_tensors.size());
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
