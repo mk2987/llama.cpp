@@ -786,7 +786,8 @@ static nvinfer1::ICudaEngine * build_trt_engine(
                     auto * net = net_builder.get_network();
                     std::string pfx = "kv_view_" + std::to_string(k) + "_";
 
-                    // view_shape = IShapeLayer(view_input) → 1D I32 [ndims]
+                    // view_shape = IShapeLayer(view_input) → 1D shape tensor
+                    // TRT-RTX returns Int64 from IShapeLayer (not Int32)
                     auto * shape_layer = net->addShape(*view_input);
                     shape_layer->setName((pfx + "shape").c_str());
 
@@ -796,19 +797,35 @@ static nvinfer1::ICudaEngine * build_trt_engine(
                         nvinfer1::ReduceOperation::kPROD, 1, /*keepDims=*/true);
                     reduce->setName((pfx + "prod").c_str());
 
+                    // Detect shape tensor type — Int64 on TRT-RTX, Int32 on older TRT
+                    nvinfer1::DataType shape_type = shape_layer->getOutput(0)->getType();
+
                     // n_rows = total_elems / n_embd_gqa
                     nvinfer1::Dims scalar_dims; scalar_dims.nbDims = 1; scalar_dims.d[0] = 1;
-                    nvinfer1::ITensor * embd_const = net_builder.create_constant_tensor(
-                        &n_embd_gqa, scalar_dims, nvinfer1::DataType::kINT32);
+                    nvinfer1::ITensor * embd_const;
+                    int64_t n_embd_gqa_i64 = n_embd_gqa;
+                    if (shape_type == nvinfer1::DataType::kINT64) {
+                        embd_const = net_builder.create_constant_tensor(
+                            &n_embd_gqa_i64, scalar_dims, nvinfer1::DataType::kINT64);
+                    } else {
+                        embd_const = net_builder.create_constant_tensor(
+                            &n_embd_gqa, scalar_dims, nvinfer1::DataType::kINT32);
+                    }
                     embd_const->setName((pfx + "embd").c_str());
 
                     auto * div_layer = net->addElementWise(
                         *reduce->getOutput(0), *embd_const, nvinfer1::ElementWiseOperation::kDIV);
                     div_layer->setName((pfx + "div").c_str());
 
-                    // size_tensor = concat(n_rows, n_embd_gqa_const) → [2] I32
-                    nvinfer1::ITensor * cols_const = net_builder.create_constant_tensor(
-                        &n_embd_gqa, scalar_dims, nvinfer1::DataType::kINT32);
+                    // size_tensor = concat(n_rows, n_embd_gqa_const) → [2] shape
+                    nvinfer1::ITensor * cols_const;
+                    if (shape_type == nvinfer1::DataType::kINT64) {
+                        cols_const = net_builder.create_constant_tensor(
+                            &n_embd_gqa_i64, scalar_dims, nvinfer1::DataType::kINT64);
+                    } else {
+                        cols_const = net_builder.create_constant_tensor(
+                            &n_embd_gqa, scalar_dims, nvinfer1::DataType::kINT32);
+                    }
                     cols_const->setName((pfx + "cols").c_str());
 
                     nvinfer1::ITensor * cat_inputs[2] = {
