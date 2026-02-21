@@ -112,6 +112,22 @@ nvinfer1::ITensor* handle_set_rows(NetworkBuilder* builder, const ggml_tensor* n
 
     nvinfer1::ITensor* kv_out = kv_layer->getOutput(0);  // [1, 1, kv_size, n_embd_gqa]
 
+    // TRT requires IKVCacheUpdateLayer output to be a network output —
+    // in-place aliased layers must write to externally-bound memory.
+    // Use kv_inplace_N naming (N = count of existing kv_inplace outputs).
+    {
+        int kv_idx = 0;
+        for (int i = 0; i < network->getNbOutputs(); i++) {
+            const char * oname = network->getOutput(i)->getName();
+            if (oname && strncmp(oname, "kv_inplace_", 11) == 0)
+                kv_idx++;
+        }
+        char kv_name[64];
+        snprintf(kv_name, sizeof(kv_name), "kv_inplace_%d", kv_idx);
+        network->markOutput(*kv_out);
+        kv_out->setName(kv_name);
+    }
+
     // -- Reshape output back to 2D [kv_size, n_embd_gqa] --
     nvinfer1::Dims out_2d;
     out_2d.nbDims = 2;

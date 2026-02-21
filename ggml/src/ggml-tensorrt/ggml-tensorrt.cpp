@@ -754,6 +754,97 @@ static nvinfer1::ICudaEngine * build_trt_engine(
             net_builder.mark_output(output, out_name);
             output_idx++;
         }
+
+        // After SET_ROWS with IKVCacheUpdateLayer, redirect any leaf VIEWs
+        // of the same cache buffer to read from the updated cache instead of
+        // the stale leaf input.  Partial VIEWs (element count differs from
+        // source) are not TRT-compatible, so they end up as leaf inputs bound
+        // to the cache address.  Without this redirect, attention reads the
+        // pre-update cache (all zeros on first pass).
+        //
+        // For each VIEW leaf of this cache buffer:
+        //   1. Use IShapeLayer on the VIEW leaf input to get runtime dims
+        //   2. Compute n_rows = product(view_dims) / cols (via shape arithmetic)
+        //   3. ISliceLayer on the updated 2D cache: first n_rows rows
+        //   4. IShuffle to the VIEW's target dims
+        //   5. Override tensor_map so downstream ops read the sliced result
+        if (native_attn_enabled && node->op == GGML_OP_SET_ROWS &&
+            node->src[2] != nullptr) {
+            const ggml_tensor * cache_buf = node->src[2];
+            nvinfer1::ITensor * updated_cache = net_builder.get_tensor(cache_buf);
+            if (updated_cache) {
+                int32_t n_embd_gqa = (int32_t)cache_buf->ne[0];
+                for (size_t k = 0; k < leaf_tensors.size(); k++) {
+                    const ggml_tensor * leaf = leaf_tensors[k];
+                    if (leaf->op != GGML_OP_VIEW || leaf->src[0] != cache_buf)
+                        continue;
+                    // This leaf VIEW reads from the same cache buffer.
+                    // Build: n_rows = product(view_runtime_shape) / n_embd_gqa
+                    nvinfer1::ITensor * view_input = net_builder.get_tensor(leaf);
+                    if (!view_input) continue;
+
+                    auto * net = net_builder.get_network();
+                    std::string pfx = "kv_view_" + std::to_string(k) + "_";
+
+                    // view_shape = IShapeLayer(view_input) → 1D I32 [ndims]
+                    auto * shape_layer = net->addShape(*view_input);
+                    shape_layer->setName((pfx + "shape").c_str());
+
+                    // total_elems = reduce_prod(view_shape)
+                    auto * reduce = net->addReduce(
+                        *shape_layer->getOutput(0),
+                        nvinfer1::ReduceOperation::kPROD, 1, /*keepDims=*/true);
+                    reduce->setName((pfx + "prod").c_str());
+
+                    // n_rows = total_elems / n_embd_gqa
+                    nvinfer1::Dims scalar_dims; scalar_dims.nbDims = 1; scalar_dims.d[0] = 1;
+                    nvinfer1::ITensor * embd_const = net_builder.create_constant_tensor(
+                        &n_embd_gqa, scalar_dims, nvinfer1::DataType::kINT32);
+                    embd_const->setName((pfx + "embd").c_str());
+
+                    auto * div_layer = net->addElementWise(
+                        *reduce->getOutput(0), *embd_const, nvinfer1::ElementWiseOperation::kDIV);
+                    div_layer->setName((pfx + "div").c_str());
+
+                    // size_tensor = concat(n_rows, n_embd_gqa_const) → [2] I32
+                    nvinfer1::ITensor * cols_const = net_builder.create_constant_tensor(
+                        &n_embd_gqa, scalar_dims, nvinfer1::DataType::kINT32);
+                    cols_const->setName((pfx + "cols").c_str());
+
+                    nvinfer1::ITensor * cat_inputs[2] = {
+                        div_layer->getOutput(0), cols_const
+                    };
+                    auto * cat = net->addConcatenation(cat_inputs, 2);
+                    cat->setAxis(0);
+                    cat->setName((pfx + "size").c_str());
+
+                    // ISliceLayer: start=[0,0], size=dynamic, stride=[1,1]
+                    nvinfer1::Dims start2, stride2, dummy_size;
+                    start2.nbDims = 2; start2.d[0] = 0; start2.d[1] = 0;
+                    stride2.nbDims = 2; stride2.d[0] = 1; stride2.d[1] = 1;
+                    dummy_size.nbDims = 2; dummy_size.d[0] = 1; dummy_size.d[1] = n_embd_gqa;
+
+                    auto * slice = net->addSlice(*updated_cache, start2, dummy_size, stride2);
+                    slice->setInput(2, *cat->getOutput(0));  // dynamic size
+                    slice->setName((pfx + "slice").c_str());
+
+                    // Reshape sliced 2D → VIEW's target TRT dims
+                    nvinfer1::Dims target = ggml_tensor_to_dims(leaf);
+                    nvinfer1::Dims safe = NetworkBuilder::make_dynamic_reshape_dims(
+                        slice->getOutput(0), target);
+                    auto * reshape = net->addShuffle(*slice->getOutput(0));
+                    reshape->setReshapeDimensions(safe);
+                    reshape->setName((pfx + "reshape").c_str());
+
+                    // Override tensor_map: downstream ops see sliced data
+                    net_builder.set_tensor(leaf, reshape->getOutput(0));
+
+                    GGML_LOG_DEBUG("%s: redirected VIEW leaf %zu of cache %s "
+                        "to ISliceLayer from IKVCacheUpdateLayer output\n",
+                        __func__, k, cache_buf->name);
+                }
+            }
+        }
     }
 
     // Engine configuration
@@ -856,6 +947,7 @@ static bool reclassify_mismatched_leaves(
     uint64_t hash,
     const std::vector<const ggml_tensor *> & leaf_tensors,
     std::unordered_set<const ggml_tensor *> & static_leaf_set,
+    const std::unordered_set<const ggml_tensor *> & kv_cache_leaves,
     bool & has_dynamic_inputs
 ) {
     nvinfer1::ICudaEngine * engine = ctx->engine_mgr->get_cached_engine(hash);
@@ -863,6 +955,10 @@ static bool reclassify_mismatched_leaves(
 
     bool needs_rebuild = false;
     for (size_t k = 0; k < leaf_tensors.size(); k++) {
+        // KV cache leaves are added as 4D with all-static dims.
+        // ggml_tensor_to_dims gives 2D — skip to avoid false reclassification.
+        if (kv_cache_leaves.count(leaf_tensors[k])) continue;
+
         char name[64];
         snprintf(name, sizeof(name), "input_%zu", k);
         nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
@@ -918,6 +1014,7 @@ static enum ggml_status execute_trt_segment(
         nvinfer1::IExecutionContext * ctx = nullptr;
         std::vector<void *> inputs;
         std::vector<void *> outputs;
+        std::vector<void *> kv_inplace;  // IKVCacheUpdateLayer writeback addrs
         std::vector<nvinfer1::Dims> input_shapes;  // cached setInputShape dims
     };
     static std::unordered_map<uint64_t, addr_cache_entry> prev_addrs;
@@ -979,6 +1076,9 @@ static enum ggml_status execute_trt_segment(
     // one cached engine shared across layers.
     auto is_segment_output = [&](const ggml_tensor * node) -> bool {
         if (is_shape_op(node->op)) return false;
+        // SET_ROWS with native attention: kv_inplace output (marked by
+        // handle_set_rows) handles the writeback — not a regular output.
+        if (native_attn_enabled && node->op == GGML_OP_SET_ROWS) return false;
         // Cross-subgraph: scheduler flag
         if (node->flags & GGML_TENSOR_FLAG_SUBGRAPH_OUTPUT) return true;
         // Inter-segment: check if any consumer is outside this TRT segment
@@ -1051,7 +1151,7 @@ static enum ggml_status execute_trt_segment(
     if (engine != nullptr) {
         bool needs_rebuild = reclassify_mismatched_leaves(
             ctx, hash, leaf_tensors, static_leaf_set,
-            has_dynamic_inputs);
+            kv_cache_leaves, has_dynamic_inputs);
         if (needs_rebuild) {
             GGML_LOG_WARN("%s: shape/profile mismatch for segment %" PRId64
                 ", rebuilding (%zu static, %zu dynamic)\n", __func__, segment_id,
@@ -1090,10 +1190,25 @@ static enum ggml_status execute_trt_segment(
     }
 
     if (has_dynamic_inputs) {
+        // Helper: KV cache leaves are added as 4D [1,1,kv_size,n_embd_gqa],
+        // but ggml_tensor_to_dims returns 2D.  Use correct 4D dims for them.
+        auto leaf_input_dims = [&](size_t k) -> nvinfer1::Dims {
+            if (kv_cache_leaves.count(leaf_tensors[k])) {
+                nvinfer1::Dims d;
+                d.nbDims = 4;
+                d.d[0] = 1;
+                d.d[1] = 1;
+                d.d[2] = (int32_t)leaf_tensors[k]->ne[1];  // kv_size
+                d.d[3] = (int32_t)leaf_tensors[k]->ne[0];  // n_embd_gqa
+                return d;
+            }
+            return ggml_tensor_to_dims(leaf_tensors[k]);
+        };
+
         auto & cached = prev_addrs[hash];
         bool shapes_cached = (cached.input_shapes.size() == leaf_tensors.size());
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
-            nvinfer1::Dims actual = ggml_tensor_to_dims(leaf_tensors[k]);
+            nvinfer1::Dims actual = leaf_input_dims(k);
             // Skip setInputShape when dims unchanged — avoids CUDA graph re-capture
             if (shapes_cached) {
                 const nvinfer1::Dims & prev = cached.input_shapes[k];
@@ -1117,7 +1232,7 @@ static enum ggml_status execute_trt_segment(
         // Update cached shapes
         cached.input_shapes.resize(leaf_tensors.size());
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
-            cached.input_shapes[k] = ggml_tensor_to_dims(leaf_tensors[k]);
+            cached.input_shapes[k] = leaf_input_dims(k);
         }
     }
 
@@ -1206,6 +1321,7 @@ static enum ggml_status execute_trt_segment(
         // Context changed (new engine build or eviction) — must rebind all
         cached_addrs.inputs.clear();
         cached_addrs.outputs.clear();
+        cached_addrs.kv_inplace.clear();
         cached_addrs.input_shapes.clear();
         cached_addrs.ctx = exec_ctx;
     }
@@ -1251,6 +1367,34 @@ static enum ggml_status execute_trt_segment(
         n_outputs++;
     }
     cached_addrs.outputs = cur_output_addrs;
+
+    // Bind kv_inplace outputs — IKVCacheUpdateLayer in-place writeback.
+    // These are extra network outputs added by handle_set_rows that must be
+    // bound to the cache buffer address (same address as the cache input).
+    if (native_attn_enabled) {
+        std::vector<void *> cur_kv_addrs;
+        int kv_idx = 0;
+        for (int idx : trt_node_indices) {
+            ggml_tensor * node = cgraph->nodes[idx];
+            if (node->op != GGML_OP_SET_ROWS || !node->src[2]) continue;
+            if (!kv_cache_leaves.count(node->src[2])) continue;
+            void * cache_addr = node->src[2]->data;
+            cur_kv_addrs.push_back(cache_addr);
+
+            bool cached = (kv_idx < (int)cached_addrs.kv_inplace.size() &&
+                           cached_addrs.kv_inplace[kv_idx] == cache_addr);
+            if (!cached) {
+                char name[64];
+                snprintf(name, sizeof(name), "kv_inplace_%d", kv_idx);
+                if (!exec_ctx->setTensorAddress(name, cache_addr)) {
+                    GGML_LOG_ERROR("%s: failed to set %s address\n", __func__, name);
+                    return GGML_STATUS_FAILED;
+                }
+            }
+            kv_idx++;
+        }
+        cached_addrs.kv_inplace = cur_kv_addrs;
+    }
 
     // Debug: log input data before execution
     if (debug_enabled) {
