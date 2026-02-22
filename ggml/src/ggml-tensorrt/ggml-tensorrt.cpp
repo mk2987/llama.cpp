@@ -1020,6 +1020,7 @@ static enum ggml_status execute_trt_segment(
     const std::unordered_set<const ggml_tensor *> & trt_node_set,
     const consumer_map_t & consumers,
     bool debug_enabled,
+    bool profile_enabled,
     int64_t segment_id
 ) {
     // Address cache: skip redundant setTensorAddress calls when addresses
@@ -1174,9 +1175,22 @@ static enum ggml_status execute_trt_segment(
                 ", rebuilding (%zu static, %zu dynamic)\n", __func__, segment_id,
                 static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size());
             ctx->engine_mgr->evict_engine(hash);
+            uint64_t old_hash = hash;
             hash = compute_graph_hash(cgraph, trt_node_indices, static_leaf_set);
             engine = ctx->engine_mgr->get_cached_engine(hash);
+            if (profile_enabled) {
+                fprintf(stderr, "[TRT-PROF] seg %" PRId64 ": reclassify hash 0x%016" PRIx64
+                    " -> 0x%016" PRIx64 " (%s)\n", segment_id, old_hash, hash,
+                    engine ? "cache hit" : "cache miss");
+            }
         }
+    }
+
+    if (profile_enabled && was_cache_miss) {
+        fprintf(stderr, "[TRT-PROF] seg %" PRId64 ": cache miss, hash=0x%016" PRIx64
+            ", nodes=%zu, leaves=%zu (%zu static, %zu dynamic)\n",
+            segment_id, hash, trt_node_indices.size(), leaf_tensors.size(),
+            static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size());
     }
 
     // ── Build engine (cache miss or post-reclassification) ──
@@ -1498,7 +1512,10 @@ static enum ggml_status execute_trt_segment(
         }
     }
 
-    (void)was_cache_miss; // used only for profiling, which is done at graph_compute level
+    if (profile_enabled) {
+        fprintf(stderr, "[TRT-PROF] seg %" PRId64 ": hash=0x%016" PRIx64 " %s\n",
+            segment_id, hash, was_cache_miss ? "MISS" : "hit");
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -1575,7 +1592,7 @@ static enum ggml_status ggml_backend_tensorrt_graph_compute(ggml_backend_t backe
         if (!seg_trt_indices.empty()) {
             ggml_status status = execute_trt_segment(
                 ctx, cgraph, seg_trt_indices, seg_trt_set, consumers,
-                debug_enabled, call_id * 100 + segment_id);
+                debug_enabled, profile_enabled, call_id * 100 + segment_id);
             if (status != GGML_STATUS_SUCCESS) return status;
             segment_id++;
             n_segments++;
