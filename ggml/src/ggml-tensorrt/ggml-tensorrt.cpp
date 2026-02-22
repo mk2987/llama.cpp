@@ -959,10 +959,9 @@ static nvinfer1::ICudaEngine * build_trt_engine(
 //   2. Profile overflow: a dynamic leaf's actual dim exceeds the engine's
 //      optimization profile max.  No reclassification needed — the rebuilt
 //      engine will have a wider profile based on the current actual dims.
-//   3. Rank mismatch: a dynamic leaf's nbDims differs from the engine's
-//      input rank (e.g. GGML ne[2] went from 1→>1, changing ggml_n_dims
-//      from 2→3).  The hash is rank-agnostic (M20b), so this is caught
-//      here.  Happens at most once per n_kv pad boundary.
+//   Note: rank mismatches (nbDims changes between prompt↔decode) are handled
+//   by the ndims fingerprint in the cache_key — different ranks produce
+//   different cache_keys, so it's a clean cache miss, not a reclassify.
 static bool reclassify_mismatched_leaves(
     ggml_backend_tensorrt_context * ctx,
     uint64_t hash,
@@ -999,27 +998,50 @@ static bool reclassify_mismatched_leaves(
                 needs_rebuild = true;
             }
         } else {
-            // Dynamic leaf: check nbDims match and profile range.
-            // nbDims can change between prompt and decode when a tensor's
-            // trailing GGML dims transition between 1 and >1 (e.g. ne[2]
-            // changes from 1 to >1 at the n_kv pad boundary).  The hash
-            // is ndims-agnostic (M20b), so this is caught here instead.
-            nvinfer1::Dims engine_dims = engine->getTensorShape(name);
-            if (engine_dims.nbDims != actual.nbDims) {
-                needs_rebuild = true;
-            } else {
-                nvinfer1::Dims max_dims = engine->getProfileShape(name, 0,
-                    nvinfer1::OptProfileSelector::kMAX);
-                for (int d = 0; d < actual.nbDims && d < max_dims.nbDims; d++) {
-                    if (actual.d[d] > max_dims.d[d]) {
-                        needs_rebuild = true;
-                        break;
-                    }
+            // Dynamic leaf: check profile range only.
+            // Rank mismatches (nbDims changes) are handled by the ndims
+            // fingerprint in cache_key — different ranks → different key →
+            // clean cache miss.  Only profile overflow needs reclassification.
+            nvinfer1::Dims max_dims = engine->getProfileShape(name, 0,
+                nvinfer1::OptProfileSelector::kMAX);
+            for (int d = 0; d < actual.nbDims && d < max_dims.nbDims; d++) {
+                if (actual.d[d] > max_dims.d[d]) {
+                    needs_rebuild = true;
+                    break;
                 }
             }
         }
     }
     return needs_rebuild;
+}
+
+// Compute an ndims fingerprint from dynamic leaves' ggml_n_dims values.
+// Prompt and decode phases produce different ndims for some tensors (e.g.
+// ne[2] transitions between 1 and >1), but the base graph hash is ndims-
+// agnostic (M20b).  This fingerprint differentiates them so both engine
+// variants stay cached simultaneously — no evict-rebuild on prompt↔decode.
+static uint32_t compute_ndims_fingerprint(
+    const std::vector<const ggml_tensor *> & leaf_tensors,
+    const std::unordered_set<const ggml_tensor *> & static_leaf_set
+) {
+    uint32_t fp = 0x811c9dc5u;  // FNV-1a offset basis (32-bit)
+    for (size_t k = 0; k < leaf_tensors.size(); k++) {
+        if (!static_leaf_set.count(leaf_tensors[k])) {
+            fp ^= (uint32_t)ggml_n_dims(leaf_tensors[k]);
+            fp *= 0x01000193u;  // FNV-1a prime (32-bit)
+        }
+    }
+    return fp;
+}
+
+// Combine a 64-bit base hash with a 32-bit fingerprint into a 64-bit key.
+// Uses FNV-1a mixing to avoid collisions between (hash, fp) pairs.
+static uint64_t combine_hash_fp(uint64_t hash, uint32_t fp) {
+    hash ^= (uint64_t)fp;
+    hash *= 1099511628211ULL;  // FNV-1a prime (64-bit)
+    hash ^= (uint64_t)(fp >> 16);
+    hash *= 1099511628211ULL;
+    return hash;
 }
 
 // Execute one TRT segment: collect leaves → hash → build/cache engine →
@@ -1165,7 +1187,15 @@ static enum ggml_status execute_trt_segment(
 
     uint64_t hash = compute_graph_hash(cgraph, trt_node_indices, static_leaf_set);
 
-    nvinfer1::ICudaEngine * engine = ctx->engine_mgr->get_cached_engine(hash);
+    // Combine base hash with an ndims fingerprint of dynamic leaves.
+    // The base hash is ndims-agnostic (M20b) so prompt and decode share the
+    // same hash even though their dynamic tensors differ in ggml_n_dims
+    // (e.g. ne[2]=1 vs ne[2]>1).  The fingerprint differentiates them so
+    // both engine variants stay cached — no evict-rebuild on prompt↔decode.
+    uint32_t ndims_fp = compute_ndims_fingerprint(leaf_tensors, static_leaf_set);
+    uint64_t cache_key = combine_hash_fp(hash, ndims_fp);
+
+    nvinfer1::ICudaEngine * engine = ctx->engine_mgr->get_cached_engine(cache_key);
 
     bool was_cache_miss = (engine == nullptr);
 
@@ -1175,6 +1205,9 @@ static enum ggml_status execute_trt_segment(
     // against the previous invocation of this segment.  On a cache miss that
     // isn't the very first call, log the first diverging node — this pinpoints
     // the root cause of unexpected rebuilds (ndims flip, op_params drift, etc).
+    // Note: diagnostics use the base `hash` (keyed by segment_id), not
+    // cache_key — both prompt and decode variants share the same structural
+    // hash, so diffing is meaningful across phase transitions.
     if (profile_enabled) {
         static std::unordered_map<int64_t, std::vector<node_hash_entry>> prev_diag;
         std::vector<node_hash_entry> cur_diag;
@@ -1233,19 +1266,22 @@ static enum ggml_status execute_trt_segment(
     // sees the incompatible shapes — no TRT ERROR messages.
     if (engine != nullptr) {
         bool needs_rebuild = reclassify_mismatched_leaves(
-            ctx, hash, leaf_tensors, static_leaf_set,
+            ctx, cache_key, leaf_tensors, static_leaf_set,
             kv_cache_leaves, has_dynamic_inputs);
         if (needs_rebuild) {
             GGML_LOG_WARN("%s: shape/profile mismatch for segment %" PRId64
                 ", rebuilding (%zu static, %zu dynamic)\n", __func__, segment_id,
                 static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size());
-            ctx->engine_mgr->evict_engine(hash);
-            uint64_t old_hash = hash;
+            ctx->engine_mgr->evict_engine(cache_key);
+            uint64_t old_cache_key = cache_key;
             hash = compute_graph_hash(cgraph, trt_node_indices, static_leaf_set);
-            engine = ctx->engine_mgr->get_cached_engine(hash);
+            ndims_fp = compute_ndims_fingerprint(leaf_tensors, static_leaf_set);
+            cache_key = combine_hash_fp(hash, ndims_fp);
+            engine = ctx->engine_mgr->get_cached_engine(cache_key);
             if (profile_enabled) {
-                fprintf(stderr, "[TRT-PROF] seg %" PRId64 ": reclassify hash 0x%016" PRIx64
-                    " -> 0x%016" PRIx64 " (%s)\n", segment_id, old_hash, hash,
+                fprintf(stderr, "[TRT-PROF] seg %" PRId64 ": reclassify key 0x%016" PRIx64
+                    " -> 0x%016" PRIx64 " ndims_fp=0x%08x (%s)\n",
+                    segment_id, old_cache_key, cache_key, ndims_fp,
                     engine ? "cache hit" : "cache miss");
             }
         }
@@ -1253,8 +1289,10 @@ static enum ggml_status execute_trt_segment(
 
     if (profile_enabled && was_cache_miss) {
         fprintf(stderr, "[TRT-PROF] seg %" PRId64 ": cache miss, hash=0x%016" PRIx64
+            " ndims_fp=0x%08x key=0x%016" PRIx64
             ", nodes=%zu, leaves=%zu (%zu static, %zu dynamic)\n",
-            segment_id, hash, trt_node_indices.size(), leaf_tensors.size(),
+            segment_id, hash, ndims_fp, cache_key,
+            trt_node_indices.size(), leaf_tensors.size(),
             static_leaf_set.size(), leaf_tensors.size() - static_leaf_set.size());
     }
 
@@ -1263,7 +1301,7 @@ static enum ggml_status execute_trt_segment(
         nvtxRangePushA("TRT engine build");
         engine = build_trt_engine(ctx, cgraph, trt_node_indices, leaf_tensors,
                                   static_leaf_set, kv_cache_leaves, has_dynamic_inputs,
-                                  is_segment_output, segment_id, hash);
+                                  is_segment_output, segment_id, cache_key);
         nvtxRangePop();
         if (!engine) {
             return GGML_STATUS_FAILED;
@@ -1279,7 +1317,7 @@ static enum ggml_status execute_trt_segment(
     static const bool cuda_graphs_env = (getenv("GGML_TENSORRT_CUDA_GRAPHS") == nullptr ||
                                           atoi(getenv("GGML_TENSORRT_CUDA_GRAPHS")) != 0);
     bool enable_cuda_graphs = cuda_graphs_env;
-    nvinfer1::IExecutionContext * exec_ctx = ctx->engine_mgr->get_or_create_context(hash, enable_cuda_graphs);
+    nvinfer1::IExecutionContext * exec_ctx = ctx->engine_mgr->get_or_create_context(cache_key, enable_cuda_graphs);
     if (!exec_ctx) {
         GGML_LOG_ERROR("%s: failed to get execution context\n", __func__);
         return GGML_STATUS_FAILED;
@@ -1290,7 +1328,7 @@ static enum ggml_status execute_trt_segment(
     // Clear them now so the shape-setting loop below sees an empty cache and
     // calls setInputShape for ALL inputs on the fresh context.
     {
-        auto & cached = prev_addrs[hash];
+        auto & cached = prev_addrs[cache_key];
         if (cached.ctx != exec_ctx) {
             cached.input_shapes.clear();
         }
@@ -1312,7 +1350,7 @@ static enum ggml_status execute_trt_segment(
             return ggml_tensor_to_dims(leaf_tensors[k]);
         };
 
-        auto & cached = prev_addrs[hash];
+        auto & cached = prev_addrs[cache_key];
         bool shapes_cached = (cached.input_shapes.size() == leaf_tensors.size());
 
         // Check if ANY shape changed.  When a shape changes, TRT invalidates
@@ -1434,7 +1472,7 @@ static enum ggml_status execute_trt_segment(
     }
 
     // Bind input addresses — skip when address unchanged from last call
-    auto & cached_addrs = prev_addrs[hash];
+    auto & cached_addrs = prev_addrs[cache_key];
     if (cached_addrs.ctx != exec_ctx) {
         // Context changed (new engine build or eviction) — must rebind all
         cached_addrs.inputs.clear();
@@ -1516,8 +1554,9 @@ static enum ggml_status execute_trt_segment(
 
     // Debug: log input data before execution
     if (debug_enabled) {
-        fprintf(stderr, "[TRT-DEBUG] seg %" PRId64 ", hash 0x%016" PRIx64 ", inputs: %zu, outputs: %d\n",
-            segment_id, hash, leaf_tensors.size(), n_outputs);
+        fprintf(stderr, "[TRT-DEBUG] seg %" PRId64 ", key 0x%016" PRIx64 " (hash 0x%016" PRIx64
+            " ndims_fp=0x%08x), inputs: %zu, outputs: %d\n",
+            segment_id, cache_key, hash, ndims_fp, leaf_tensors.size(), n_outputs);
 
         for (size_t k = 0; k < leaf_tensors.size(); k++) {
             const ggml_tensor * leaf = leaf_tensors[k];
@@ -1578,8 +1617,8 @@ static enum ggml_status execute_trt_segment(
     }
 
     if (profile_enabled) {
-        fprintf(stderr, "[TRT-PROF] seg %" PRId64 ": hash=0x%016" PRIx64 " %s\n",
-            segment_id, hash, was_cache_miss ? "MISS" : "hit");
+        fprintf(stderr, "[TRT-PROF] seg %" PRId64 ": key=0x%016" PRIx64 " ndims_fp=0x%08x %s\n",
+            segment_id, cache_key, ndims_fp, was_cache_miss ? "MISS" : "hit");
     }
 
     return GGML_STATUS_SUCCESS;
