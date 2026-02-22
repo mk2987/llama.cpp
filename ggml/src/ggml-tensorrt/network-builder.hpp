@@ -174,11 +174,17 @@ nvinfer1::ITensor* handle_get_rows(NetworkBuilder* builder, const ggml_tensor* n
 // GLU (gated linear unit) operations
 nvinfer1::ITensor* handle_glu(NetworkBuilder* builder, const ggml_tensor* node);
 
-// Rotary position embedding (ROPE)
+// Rotary position embedding (ROPE) — decomposed path
 nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node);
+
+// Rotary position embedding (ROPE) — native IRotaryEmbeddingLayer path
+nvinfer1::ITensor* handle_rope_native(NetworkBuilder* builder, const ggml_tensor* node);
 
 // SET_ROWS → IKVCacheUpdateLayer (native attention path)
 nvinfer1::ITensor* handle_set_rows(NetworkBuilder* builder, const ggml_tensor* node);
+
+// FLASH_ATTN_EXT → IAttention (native attention path)
+nvinfer1::ITensor* handle_flash_attn_ext(NetworkBuilder* builder, const ggml_tensor* node);
 
 // Shared activation helper — applies an activation function to a TRT tensor.
 // Used by both unary ops and GLU.  Returns nullptr on failure.

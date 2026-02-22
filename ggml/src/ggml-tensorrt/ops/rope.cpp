@@ -465,9 +465,280 @@ nvinfer1::ITensor* handle_rope(NetworkBuilder* builder, const ggml_tensor* node)
     return output;
 }
 
-// Register the ROPE operation handler
+// Handle GGML_OP_ROPE — Native path using TRT IRotaryEmbeddingLayer
+//
+// Replaces the decomposed rotation (slice/multiply/subtract/add/concat) with
+// a single addRotaryEmbedding call.  Still computes cos/sin dynamically from
+// freq_base/freq_scale, then reshapes for the native API.
+//
+// TRT addRotaryEmbedding expects:
+//   input:    [B, H, S, D]
+//   cosCache: [B, S, half]  (without positionIds)
+//   sinCache: [B, S, half]  (without positionIds)
+//
+// Our TRT tensors after ggml_tensor_to_dims reversal:
+//   input: (n_tokens, n_heads, head_dim) = [S, H, D]
+//   pos:   (n_tokens,) = [S]
+//
+nvinfer1::ITensor* handle_rope_native(NetworkBuilder* builder, const ggml_tensor* node) {
+    GGML_ASSERT(builder != nullptr);
+    GGML_ASSERT(node != nullptr);
+    GGML_ASSERT(node->op == GGML_OP_ROPE);
+
+    const ggml_tensor* src0 = node->src[0];  // Q/K data
+    const ggml_tensor* src1 = node->src[1];  // position IDs (I32)
+    GGML_ASSERT(src0 != nullptr);
+    GGML_ASSERT(src1 != nullptr);
+
+    nvinfer1::ITensor* input = builder->get_tensor(src0);
+    nvinfer1::ITensor* pos   = builder->get_tensor(src1);
+    if (input == nullptr || pos == nullptr) {
+        GGML_LOG_ERROR("%s: input or position tensor not found in network\n", __func__);
+        return nullptr;
+    }
+
+    auto* network = builder->get_network();
+
+    // ── Extract op parameters ──
+    const int n_dims = ((const int32_t *)node->op_params)[1];
+    const int mode   = ((const int32_t *)node->op_params)[2];
+
+    float freq_base  = 0.0f;
+    float freq_scale = 0.0f;
+    memcpy(&freq_base,  (const float *)node->op_params + 5, sizeof(float));
+    memcpy(&freq_scale, (const float *)node->op_params + 6, sizeof(float));
+
+    const bool is_neox = (mode == GGML_ROPE_TYPE_NEOX);
+    const int half = n_dims / 2;
+
+    // Save original input type and upcast to F32 for computation
+    nvinfer1::DataType input_type = input->getType();
+    input = builder->maybe_cast(input, nvinfer1::DataType::kFLOAT);
+
+    const int64_t head_dim = src0->ne[0];
+
+    // Unique name prefix for layer naming
+    std::string pfx = "rope_native_" + std::to_string(reinterpret_cast<uintptr_t>(node));
+
+    // ── Build frequency constant table ──
+    // freq[i] = freq_scale / pow(freq_base, 2.0*i/n_dims) for i = 0..half-1
+    // Shape: (1, half) for broadcasting with pos (n_tokens, 1)
+    std::vector<float> freq_data(half);
+    for (int i = 0; i < half; i++) {
+        freq_data[i] = freq_scale / powf(freq_base, 2.0f * (float)i / (float)n_dims);
+    }
+
+    nvinfer1::Dims freq_dims;
+    freq_dims.nbDims = 2;
+    freq_dims.d[0] = 1;
+    freq_dims.d[1] = half;
+
+    nvinfer1::ITensor* freq = builder->create_constant_tensor(
+        freq_data.data(), freq_dims, nvinfer1::DataType::kFLOAT);
+    if (freq == nullptr) {
+        GGML_LOG_ERROR("%s: failed to create frequency constant\n", __func__);
+        return nullptr;
+    }
+
+    // ── Compute cos/sin caches ──
+    // pos: TRT shape (n_tokens,) [could be dynamic dim 0]
+    // Reshape to (n_tokens, 1) for broadcasting with freq (1, half)
+    nvinfer1::ITensor* pos_f32 = builder->maybe_cast(pos, nvinfer1::DataType::kFLOAT);
+
+    nvinfer1::Dims pos_2d;
+    pos_2d.nbDims = 2;
+    nvinfer1::Dims pos_curr = pos_f32->getDimensions();
+    pos_2d.d[0] = (pos_curr.d[0] == -1) ? 0 : pos_curr.d[0];
+    pos_2d.d[1] = 1;
+
+    auto* pos_reshape = network->addShuffle(*pos_f32);
+    if (pos_reshape == nullptr) {
+        GGML_LOG_ERROR("%s: failed to reshape position to 2D\n", __func__);
+        return nullptr;
+    }
+    pos_reshape->setReshapeDimensions(pos_2d);
+    pos_reshape->setName((pfx + "_pos_2d").c_str());
+    nvinfer1::ITensor* pos_2d_t = pos_reshape->getOutput(0);
+
+    // theta = pos_2d * freq  → (n_tokens, half)
+    auto* theta_layer = network->addElementWise(
+        *pos_2d_t, *freq, nvinfer1::ElementWiseOperation::kPROD);
+    if (theta_layer == nullptr) {
+        GGML_LOG_ERROR("%s: failed to create theta layer\n", __func__);
+        return nullptr;
+    }
+    theta_layer->setName((pfx + "_theta").c_str());
+    nvinfer1::ITensor* theta = theta_layer->getOutput(0);
+
+    // cos(theta) and sin(theta) → (n_tokens, half)
+    auto* cos_layer = network->addUnary(*theta, nvinfer1::UnaryOperation::kCOS);
+    auto* sin_layer = network->addUnary(*theta, nvinfer1::UnaryOperation::kSIN);
+    if (cos_layer == nullptr || sin_layer == nullptr) {
+        GGML_LOG_ERROR("%s: failed to create cos/sin layers\n", __func__);
+        return nullptr;
+    }
+    cos_layer->setName((pfx + "_cos").c_str());
+    sin_layer->setName((pfx + "_sin").c_str());
+    nvinfer1::ITensor* cos_theta = cos_layer->getOutput(0);  // (n_tokens, half)
+    nvinfer1::ITensor* sin_theta = sin_layer->getOutput(0);  // (n_tokens, half)
+
+    nvinfer1::ITensor* cos_cache = nullptr;
+    nvinfer1::ITensor* sin_cache = nullptr;
+
+    // ── Build shape tensor from pos for consistent dynamic S ──
+    // The pos tensor always has the correct n_tokens (dynamic).  Using its
+    // runtime shape to drive both cosCache and input reshapes ensures TRT sees
+    // the same dynamic S dimension in both, avoiding static-vs-dynamic mismatch
+    // when ggml_n_dims strips n_tokens=1 during decode.
+    auto* pos_shape_layer = network->addShape(*pos_f32);
+    if (pos_shape_layer == nullptr) {
+        GGML_LOG_ERROR("%s: failed to create pos shape layer\n", __func__);
+        return nullptr;
+    }
+    pos_shape_layer->setName((pfx + "_pos_shape").c_str());
+    nvinfer1::ITensor* pos_shape = pos_shape_layer->getOutput(0);  // 1D: [n_tokens]
+    nvinfer1::DataType shape_type = pos_shape->getType();  // INT64 on TRT-RTX
+
+    // Helper: create a 1-element shape constant matching pos_shape's type
+    auto make_shape_scalar = [&](int64_t value) -> nvinfer1::ITensor* {
+        nvinfer1::Dims d1{1, {1}};
+        if (shape_type == nvinfer1::DataType::kINT64) {
+            return builder->create_constant_tensor(&value, d1, nvinfer1::DataType::kINT64);
+        } else {
+            int32_t v32 = (int32_t)value;
+            return builder->create_constant_tensor(&v32, d1, nvinfer1::DataType::kINT32);
+        }
+    };
+
+    nvinfer1::ITensor* shape_1     = make_shape_scalar(1);
+    nvinfer1::ITensor* shape_half  = make_shape_scalar(half);
+    nvinfer1::ITensor* shape_heads = make_shape_scalar(src0->ne[1]);  // n_heads
+    nvinfer1::ITensor* shape_dim   = make_shape_scalar(head_dim);
+
+    // ── Reshape cos/sin to [B=1, S=n_tokens, half] via shape tensor ──
+    // cosCache shape: (batchSize, sequenceLength, rotaryEmbeddingDim/2)
+    {
+        nvinfer1::ITensor* cache_parts[] = {shape_1, pos_shape, shape_half};
+        auto* cache_shape_concat = network->addConcatenation(cache_parts, 3);
+        if (cache_shape_concat == nullptr) {
+            GGML_LOG_ERROR("%s: failed to build cache shape tensor\n", __func__);
+            return nullptr;
+        }
+        cache_shape_concat->setAxis(0);
+        cache_shape_concat->setName((pfx + "_cache_shape").c_str());
+        nvinfer1::ITensor* cache_shape = cache_shape_concat->getOutput(0);
+
+        auto* cos_reshape = network->addShuffle(*cos_theta);
+        if (cos_reshape == nullptr) {
+            GGML_LOG_ERROR("%s: failed to reshape cos cache\n", __func__);
+            return nullptr;
+        }
+        cos_reshape->setInput(1, *cache_shape);
+        cos_reshape->setName((pfx + "_cos_cache").c_str());
+        cos_cache = cos_reshape->getOutput(0);
+
+        auto* sin_reshape = network->addShuffle(*sin_theta);
+        if (sin_reshape == nullptr) {
+            GGML_LOG_ERROR("%s: failed to reshape sin cache\n", __func__);
+            return nullptr;
+        }
+        sin_reshape->setInput(1, *cache_shape);
+        sin_reshape->setName((pfx + "_sin_cache").c_str());
+        sin_cache = sin_reshape->getOutput(0);
+    }
+
+    // ── Reshape input to [B=1, S=n_tokens, H=n_heads, D=head_dim] via shape tensor ──
+    // Then permute to [B, H, S, D].
+    // Using pos_shape for S ensures the dynamic dimension matches cosCache.
+    // Input may be 2D (decode, n_tokens=1 stripped) or 3D (prompt) or 4D.
+    nvinfer1::ITensor* input_bhsd = nullptr;
+    {
+        nvinfer1::ITensor* bshd_parts[] = {shape_1, pos_shape, shape_heads, shape_dim};
+        auto* bshd_concat = network->addConcatenation(bshd_parts, 4);
+        if (bshd_concat == nullptr) {
+            GGML_LOG_ERROR("%s: failed to build input shape tensor\n", __func__);
+            return nullptr;
+        }
+        bshd_concat->setAxis(0);
+        bshd_concat->setName((pfx + "_bshd_shape").c_str());
+        nvinfer1::ITensor* bshd_shape = bshd_concat->getOutput(0);
+
+        auto* input_shuffle = network->addShuffle(*input);
+        if (input_shuffle == nullptr) {
+            GGML_LOG_ERROR("%s: failed to create input reshape\n", __func__);
+            return nullptr;
+        }
+        input_shuffle->setInput(1, *bshd_shape);
+        input_shuffle->setSecondTranspose(nvinfer1::Permutation{0, 2, 1, 3});
+        input_shuffle->setName((pfx + "_to_bhsd").c_str());
+        input_bhsd = input_shuffle->getOutput(0);  // [B, H, S, D]
+    }
+
+    // ── addRotaryEmbedding ──
+    // interleaved = true for NORMAL mode (pairs), false for NEOX (split halves)
+    auto* rope_layer = network->addRotaryEmbedding(
+        *input_bhsd, *cos_cache, *sin_cache,
+        /*interleaved=*/ !is_neox,
+        /*rotaryEmbeddingDim=*/ n_dims);
+    if (rope_layer == nullptr) {
+        GGML_LOG_ERROR("%s: addRotaryEmbedding failed\n", __func__);
+        return nullptr;
+    }
+    rope_layer->setName((pfx + "_rope").c_str());
+    nvinfer1::ITensor* rope_out = rope_layer->getOutput(0);  // [B, H, S, D]
+
+    // ── Reshape output back to [S, H, D] ──
+    // Step 1: permute [B, H, S, D] → [B, S, H, D]
+    auto* perm_out = network->addShuffle(*rope_out);
+    if (perm_out == nullptr) {
+        GGML_LOG_ERROR("%s: failed to create output permute\n", __func__);
+        return nullptr;
+    }
+    perm_out->setSecondTranspose(nvinfer1::Permutation{0, 2, 1, 3});
+    perm_out->setName((pfx + "_perm_out").c_str());
+    nvinfer1::ITensor* output_bshd = perm_out->getOutput(0);  // [1, S, H, D]
+
+    // Step 2: strip batch dim → restore original input shape.
+    // Use the original input's runtime shape (via IShapeLayer) as the reshape
+    // target.  This handles all ndims cases (2D decode, 3D prompt, 4D batch)
+    // and preserves dynamic dimensions correctly.
+    auto* orig_shape_layer = network->addShape(*input);
+    if (orig_shape_layer == nullptr) {
+        GGML_LOG_ERROR("%s: failed to create original shape layer\n", __func__);
+        return nullptr;
+    }
+    orig_shape_layer->setName((pfx + "_orig_shape").c_str());
+
+    auto* strip_shuffle = network->addShuffle(*output_bshd);
+    if (strip_shuffle == nullptr) {
+        GGML_LOG_ERROR("%s: failed to strip batch dim\n", __func__);
+        return nullptr;
+    }
+    strip_shuffle->setInput(1, *orig_shape_layer->getOutput(0));
+    strip_shuffle->setName((pfx + "_strip_batch").c_str());
+    nvinfer1::ITensor* output = strip_shuffle->getOutput(0);
+
+    // ── Cast back to original type ──
+    output = builder->maybe_cast(output, input_type);
+
+    GGML_LOG_DEBUG("%s: mode=%s, n_dims=%d, head_dim=%" PRId64 ", freq_base=%.1f, freq_scale=%.4f, output shape %s\n",
+        __func__, is_neox ? "NEOX" : "NORMAL", n_dims, head_dim,
+        freq_base, freq_scale,
+        dims_to_string(output->getDimensions()).c_str());
+
+    return output;
+}
+
+// Register the ROPE operation handler — native path when GGML_TENSORRT_NATIVE_ATTN
+// is enabled (default), decomposed path when explicitly disabled.
 static void __attribute__((constructor)) register_rope_handler() {
-    NetworkBuilder::register_op_handler(GGML_OP_ROPE, handle_rope);
+    const char* env = getenv("GGML_TENSORRT_NATIVE_ATTN");
+    bool native = (env == nullptr || atoi(env) != 0);
+    if (native) {
+        NetworkBuilder::register_op_handler(GGML_OP_ROPE, handle_rope_native);
+    } else {
+        NetworkBuilder::register_op_handler(GGML_OP_ROPE, handle_rope);
+    }
 }
 
 } // namespace ggml_tensorrt

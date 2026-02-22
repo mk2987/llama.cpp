@@ -373,8 +373,8 @@ static bool is_walkthrough_op(ggml_op op) {
 // built into the TRT engine via IKVCacheUpdateLayer instead of being executed
 // as a standalone CUDA kernel.  This eliminates the segment flush that
 // SET_ROWS causes (2 flushes per layer × 26 layers = 52 GPU bubbles/pass).
-static const bool native_attn_enabled = (getenv("GGML_TENSORRT_NATIVE_ATTN") != nullptr
-                                          && atoi(getenv("GGML_TENSORRT_NATIVE_ATTN")) != 0);
+static const bool native_attn_enabled = (getenv("GGML_TENSORRT_NATIVE_ATTN") == nullptr
+                                          || atoi(getenv("GGML_TENSORRT_NATIVE_ATTN")) != 0);
 
 // Check if an op is a trivial CUDA op executed outside the TRT engine.
 // These are handled directly by custom CUDA kernels in graph_compute.
@@ -2123,6 +2123,28 @@ static bool ggml_backend_tensorrt_device_supports_op(ggml_backend_dev_t dev, con
             if (ext_factor != 0.0f) {
                 return false;
             }
+            return true;
+        }
+        case GGML_OP_FLASH_ATTN_EXT:
+        {
+            if (!native_attn_enabled) return false;
+            // Output must be F32 (GGML FLASH_ATTN_EXT always outputs F32)
+            if (op->type != GGML_TYPE_F32) return false;
+            // Q/K/V must be supported compute types
+            for (int i = 0; i < 3; i++) {
+                if (!op->src[i] || !is_supported_compute_type(op->src[i]->type))
+                    return false;
+            }
+            // Mask type check (if present)
+            if (op->src[3] && !is_supported_compute_type(op->src[3]->type))
+                return false;
+            // Reject sinks (src[4])
+            if (op->src[4] != nullptr) return false;
+            // Reject max_bias (ALiBi) and logit_softcap
+            float max_bias = 0.0f, logit_softcap = 0.0f;
+            memcpy(&max_bias, (const float *)op->op_params + 1, sizeof(float));
+            memcpy(&logit_softcap, (const float *)op->op_params + 2, sizeof(float));
+            if (max_bias != 0.0f || logit_softcap != 0.0f) return false;
             return true;
         }
         case GGML_OP_UNARY:
