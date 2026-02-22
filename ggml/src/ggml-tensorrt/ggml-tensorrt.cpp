@@ -951,7 +951,7 @@ static nvinfer1::ICudaEngine * build_trt_engine(
 // Check whether a cached engine can accept the current leaf shapes.
 // Returns true if a rebuild is needed.
 //
-// Two cases require a rebuild:
+// Three cases require a rebuild:
 //   1. Static mismatch: a leaf classified as static has a shape that
 //      differs from the engine's baked-in dims.  The leaf is reclassified
 //      as dynamic (erased from static_leaf_set) so the rebuilt engine
@@ -959,6 +959,10 @@ static nvinfer1::ICudaEngine * build_trt_engine(
 //   2. Profile overflow: a dynamic leaf's actual dim exceeds the engine's
 //      optimization profile max.  No reclassification needed — the rebuilt
 //      engine will have a wider profile based on the current actual dims.
+//   3. Rank mismatch: a dynamic leaf's nbDims differs from the engine's
+//      input rank (e.g. GGML ne[2] went from 1→>1, changing ggml_n_dims
+//      from 2→3).  The hash is rank-agnostic (M20b), so this is caught
+//      here.  Happens at most once per n_kv pad boundary.
 static bool reclassify_mismatched_leaves(
     ggml_backend_tensorrt_context * ctx,
     uint64_t hash,
@@ -995,13 +999,22 @@ static bool reclassify_mismatched_leaves(
                 needs_rebuild = true;
             }
         } else {
-            // Dynamic leaf: check if actual dims fit within profile range
-            nvinfer1::Dims max_dims = engine->getProfileShape(name, 0,
-                nvinfer1::OptProfileSelector::kMAX);
-            for (int d = 0; d < actual.nbDims && d < max_dims.nbDims; d++) {
-                if (actual.d[d] > max_dims.d[d]) {
-                    needs_rebuild = true;
-                    break;
+            // Dynamic leaf: check nbDims match and profile range.
+            // nbDims can change between prompt and decode when a tensor's
+            // trailing GGML dims transition between 1 and >1 (e.g. ne[2]
+            // changes from 1 to >1 at the n_kv pad boundary).  The hash
+            // is ndims-agnostic (M20b), so this is caught here instead.
+            nvinfer1::Dims engine_dims = engine->getTensorShape(name);
+            if (engine_dims.nbDims != actual.nbDims) {
+                needs_rebuild = true;
+            } else {
+                nvinfer1::Dims max_dims = engine->getProfileShape(name, 0,
+                    nvinfer1::OptProfileSelector::kMAX);
+                for (int d = 0; d < actual.nbDims && d < max_dims.nbDims; d++) {
+                    if (actual.d[d] > max_dims.d[d]) {
+                        needs_rebuild = true;
+                        break;
+                    }
                 }
             }
         }
