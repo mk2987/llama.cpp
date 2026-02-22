@@ -33,14 +33,35 @@ uint64_t compute_graph_hash(const ggml_cgraph * cgraph, const std::vector<int> &
 
 // Compute a shape-agnostic hash for dynamic input support.
 // Like the node_indices overload, but shapes of dynamic tensors (those NOT
-// in static_leaves) are excluded from the hash.  Only type + ndims are hashed
-// for dynamic tensors.  Static tensor shapes (weights) are fully hashed.
-// This produces batch-independent hashes — different batch sizes yield the
-// same hash, enabling one cached engine to serve all batch sizes.
+// in static_leaves) are excluded from the hash.  Only type + a constant rank
+// placeholder (GGML_MAX_DIMS) are hashed for dynamic tensors.  Static tensor
+// shapes (weights) are fully hashed.  This produces batch-independent hashes
+// — different batch sizes yield the same hash, enabling one cached engine to
+// serve all batch sizes.
 uint64_t compute_graph_hash(
     const ggml_cgraph * cgraph,
     const std::vector<int> & node_indices,
     const std::unordered_set<const ggml_tensor *> & static_leaves
+);
+
+// Per-node hash diagnostic entry — captures each node's contribution to the
+// graph hash so that on a cache miss we can diff against the previous call
+// and pinpoint exactly which node changed.
+struct node_hash_entry {
+    uint64_t cumulative_hash;  // running hash AFTER this node
+    int32_t  op;               // GGML_OP_*
+    int32_t  type;             // output type
+    int64_t  ne[GGML_MAX_DIMS];// output shape
+    int32_t  n_src;            // number of non-null sources
+};
+
+// Diagnostic hash: returns the same hash as compute_graph_hash (3-arg) but
+// also fills `entries` with per-node snapshots for post-hoc diffing.
+uint64_t compute_graph_hash_diagnostic(
+    const ggml_cgraph * cgraph,
+    const std::vector<int> & node_indices,
+    const std::unordered_set<const ggml_tensor *> & static_leaves,
+    std::vector<node_hash_entry> & entries
 );
 
 // Per-input optimization profile info for dynamic shape engines

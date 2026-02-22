@@ -1146,14 +1146,66 @@ static enum ggml_status execute_trt_segment(
     // ── Engine cache lookup ──
     //
     // Shape-agnostic hash: static leaf shapes are fully hashed (weight dims
-    // are constant), dynamic tensor shapes are excluded (only type + ndims).
-    // This makes the hash batch-independent — one engine serves all batch sizes.
+    // are constant), dynamic tensor shapes are excluded (only type + constant
+    // rank placeholder).  This makes the hash batch-independent — one cached
+    // engine serves all batch sizes.
 
     uint64_t hash = compute_graph_hash(cgraph, trt_node_indices, static_leaf_set);
 
     nvinfer1::ICudaEngine * engine = ctx->engine_mgr->get_cached_engine(hash);
 
     bool was_cache_miss = (engine == nullptr);
+
+    // ── Hash diagnostic: diff per-node contributions on cache miss ──
+    //
+    // When profile is enabled, store per-node hash snapshots so we can diff
+    // against the previous invocation of this segment.  On a cache miss that
+    // isn't the very first call, log the first diverging node — this pinpoints
+    // the root cause of unexpected rebuilds (ndims flip, op_params drift, etc).
+    if (profile_enabled) {
+        static std::unordered_map<int64_t, std::vector<node_hash_entry>> prev_diag;
+        std::vector<node_hash_entry> cur_diag;
+        uint64_t diag_hash = compute_graph_hash_diagnostic(
+            cgraph, trt_node_indices, static_leaf_set, cur_diag);
+        (void)diag_hash;  // same as `hash` — just used for the side-effect entries
+
+        if (was_cache_miss) {
+            auto it = prev_diag.find(segment_id);
+            if (it != prev_diag.end() && !it->second.empty()) {
+                const auto & prev = it->second;
+                bool found_diff = false;
+                size_t min_n = std::min(prev.size(), cur_diag.size());
+                for (size_t ni = 0; ni < min_n && !found_diff; ni++) {
+                    if (prev[ni].cumulative_hash != cur_diag[ni].cumulative_hash) {
+                        found_diff = true;
+                        const ggml_tensor * node = cgraph->nodes[trt_node_indices[ni]];
+                        fprintf(stderr, "[TRT-PROF] seg %" PRId64 ": HASH DIFF at node[%zu/%zu] "
+                            "op=%s type=%s shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                            "n_src=%d hash 0x%016" PRIx64 "->0x%016" PRIx64 "\n",
+                            segment_id, ni, cur_diag.size(),
+                            ggml_op_name(node->op), ggml_type_name(node->type),
+                            node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                            cur_diag[ni].n_src,
+                            prev[ni].cumulative_hash, cur_diag[ni].cumulative_hash);
+                        // Also log src shapes for the diverging node
+                        for (int j = 0; j < GGML_MAX_SRC && node->src[j]; j++) {
+                            const ggml_tensor * s = node->src[j];
+                            fprintf(stderr, "[TRT-PROF]   src[%d]: op=%s type=%s "
+                                "shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] %s\n",
+                                j, ggml_op_name(s->op), ggml_type_name(s->type),
+                                s->ne[0], s->ne[1], s->ne[2], s->ne[3],
+                                static_leaf_set.count(s) ? "[STATIC]" : "[DYNAMIC]");
+                        }
+                    }
+                }
+                if (!found_diff && prev.size() != cur_diag.size()) {
+                    fprintf(stderr, "[TRT-PROF] seg %" PRId64 ": HASH DIFF — node count changed "
+                        "%zu -> %zu\n", segment_id, prev.size(), cur_diag.size());
+                }
+            }
+        }
+        prev_diag[segment_id] = std::move(cur_diag);
+    }
 
     // ── Validate cached engine against current shapes ──
     //

@@ -117,20 +117,19 @@ uint64_t compute_graph_hash(
         // Hash output data type (always)
         hash = fnv1a_hash_value(hash, static_cast<int32_t>(node->type));
 
-        // Hash output ndims (always) — but NOT output shape values
-        // (output shapes depend on dynamic input shapes)
-        int n_dims = 0;
-        for (int d = GGML_MAX_DIMS - 1; d >= 0; d--) {
-            if (node->ne[d] > 1) { n_dims = d + 1; break; }
-        }
-        if (n_dims == 0) n_dims = 1;
-        hash = fnv1a_hash_value(hash, n_dims);
+        // Hash a constant rank placeholder — NOT output shape values
+        // (output shapes depend on dynamic input shapes).
+        // We use GGML_MAX_DIMS instead of computed ndims because ndims
+        // (highest dim > 1) can flip when a dimension transitions between
+        // 1 and >1 (e.g. n_kv pad from 256→512 changes ne[2] from 1→>1
+        // in some attention tensors), causing spurious cache misses.
+        hash = fnv1a_hash_value(hash, static_cast<int>(GGML_MAX_DIMS));
 
         // Hash op_params — but skip for VIEW ops whose params contain
         // byte offsets and strides that change per layer and per token
         // (each layer's KV cache VIEW has a different offset).  The
         // structural properties of a VIEW (output shape, source shape)
-        // are already captured by the ndims/type hashing above.
+        // are already captured by the type/rank hashing above.
         if (node->op != GGML_OP_VIEW) {
             hash = fnv1a_hash_bytes(hash, node->op_params, sizeof(node->op_params));
         }
@@ -148,18 +147,76 @@ uint64_t compute_graph_hash(
                     }
                 } else {
                     // Dynamic source (activation, position, or intermediate node):
-                    // hash only ndims, not shape values
-                    int src_ndims = 0;
-                    for (int d = GGML_MAX_DIMS - 1; d >= 0; d--) {
-                        if (src->ne[d] > 1) { src_ndims = d + 1; break; }
-                    }
-                    if (src_ndims == 0) src_ndims = 1;
-                    hash = fnv1a_hash_value(hash, src_ndims);
+                    // hash only a constant rank placeholder, not shape values.
+                    // Same rationale as node output: computed ndims can flip
+                    // when dimensions transition between 1 and >1.
+                    hash = fnv1a_hash_value(hash, static_cast<int>(GGML_MAX_DIMS));
                 }
             } else {
                 hash = fnv1a_hash_value(hash, static_cast<int32_t>(-1));
             }
         }
+    }
+
+    return hash;
+}
+
+uint64_t compute_graph_hash_diagnostic(
+    const ggml_cgraph * cgraph,
+    const std::vector<int> & node_indices,
+    const std::unordered_set<const ggml_tensor *> & static_leaves,
+    std::vector<node_hash_entry> & entries
+) {
+    entries.clear();
+    entries.reserve(node_indices.size());
+
+    uint64_t hash = FNV_OFFSET_BASIS;
+
+    for (int i : node_indices) {
+        GGML_ASSERT(i >= 0 && i < cgraph->n_nodes);
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        // ── Identical hashing logic as compute_graph_hash (3-arg) ──
+
+        hash = fnv1a_hash_value(hash, static_cast<int32_t>(node->op));
+        hash = fnv1a_hash_value(hash, static_cast<int32_t>(node->type));
+        hash = fnv1a_hash_value(hash, static_cast<int>(GGML_MAX_DIMS));
+
+        if (node->op != GGML_OP_VIEW) {
+            hash = fnv1a_hash_bytes(hash, node->op_params, sizeof(node->op_params));
+        }
+
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                const ggml_tensor * src = node->src[j];
+                hash = fnv1a_hash_value(hash, static_cast<int32_t>(src->type));
+
+                if (static_leaves.count(src)) {
+                    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                        hash = fnv1a_hash_value(hash, src->ne[d]);
+                    }
+                } else {
+                    hash = fnv1a_hash_value(hash, static_cast<int>(GGML_MAX_DIMS));
+                }
+            } else {
+                hash = fnv1a_hash_value(hash, static_cast<int32_t>(-1));
+            }
+        }
+
+        // Snapshot this node's contribution
+        node_hash_entry e;
+        e.cumulative_hash = hash;
+        e.op   = static_cast<int32_t>(node->op);
+        e.type = static_cast<int32_t>(node->type);
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            e.ne[d] = node->ne[d];
+        }
+        int nsrc = 0;
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) nsrc++;
+        }
+        e.n_src = nsrc;
+        entries.push_back(e);
     }
 
     return hash;
